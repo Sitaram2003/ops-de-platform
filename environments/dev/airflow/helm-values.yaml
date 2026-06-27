@@ -29,11 +29,11 @@ dags:
     enabled: false
   gitSync:
     enabled: true
-    repo: git@github.com:Sitaram2003/ops-de-jobs.git   # DAGs live in de-jobs, not de-platform
-    branch: main   # trunk-based: all envs pull DAGs from main; diff is image tags, not branches
+    repo: git@github.com:Sitaram2003/ops-de-jobs.git
+    branch: main
     rev: HEAD
     depth: 1
-    subPath: airflow   # exposes de-jobs/airflow/ → repo/HEAD/; dags_folder = repo/HEAD/dags
+    subPath: airflow
     sshKeySecret: git-credentials
     period: 60s
     containerName: git-sync
@@ -54,10 +54,10 @@ webserver:
   resources:
     requests:
       cpu: 250m
-      memory: 256Mi
+      memory: 512Mi
     limits:
       cpu: 500m
-      memory: 512Mi
+      memory: 1Gi
   service:
     type: ClusterIP
   defaultUser:
@@ -67,7 +67,7 @@ webserver:
     email: ops.dataeng@gmail.com
     firstName: Airflow
     lastName: Admin
-    password: ~
+    password: "Admin@123"
 
 # ── Triggerer ─────────────────────────────────────────────────────────────────
 triggerer:
@@ -84,13 +84,19 @@ triggerer:
 fernetKeySecretName: airflow-fernet-key
 webserverSecretKeySecretName: airflow-webserver-secret
 
+data:
+  metadataSecretName: airflow-metadata-conn  
 # ── PostgreSQL — emptyDir in dev (data lost on pod restart, intentional) ──────
 postgresql:
   enabled: true
-  auth:
-    existingSecret: airflow-postgres-secret
+  image:
+    repository: bitnamilegacy/postgresql
+    tag: "16.1.0-debian-11-r15"
+  auth:                      
+    existingSecret: airflow-postgres-secret     
     secretKeys:
       adminPasswordKey: postgresql-password
+
   primary:
     persistence:
       enabled: false
@@ -101,36 +107,30 @@ postgresql:
       limits:
         cpu: 500m
         memory: 512Mi
+    podSecurityContext:
+      enabled: true
+      fsGroup: 1001
+    containerSecurityContext:
+      enabled: true
+      runAsUser: 1001
+      runAsNonRoot: true
+      allowPrivilegeEscalation: false
 
 # ── Service account ───────────────────────────────────────────────────────────
 serviceAccount:
   create: false
   name: airflow-sa
 
-# ── Node placement: operators-ng ──────────────────────────────────────────────
-tolerations:
-  - key: dedicated
-    operator: Equal
-    value: operators
-    effect: NoSchedule
-affinity:
-  nodeAffinity:
-    requiredDuringSchedulingIgnoredDuringExecution:
-      nodeSelectorTerms:
-        - matchExpressions:
-            - key: role
-              operator: In
-              values:
-                - operators
-
 # ── Airflow Variables (injected as environment variables) ─────────────────────
 env:
   - name: AIRFLOW_VAR_SPARK_DQ_REPORT_IMAGE
-    value: "PLACEHOLDER_ECR/spark-dq-report:latest"
+    value: "940507692220.dkr.ecr.ap-south-1.amazonaws.com/spark-dq-report:latest"
   - name: AIRFLOW_VAR_SPARK_CLICKSTREAM_AGG_IMAGE
-    value: "PLACEHOLDER_ECR/spark-clickstream-agg:latest"
+    value: "940507692220.dkr.ecr.ap-south-1.amazonaws.com/spark-clickstream-agg:latest"
   - name: AIRFLOW_VAR_SPARK_TRANSACTION_ANALYTICS_IMAGE
-    value: "PLACEHOLDER_ECR/spark-transaction-analytics:latest"
+    value: "940507692220.dkr.ecr.ap-south-1.amazonaws.com/spark-transaction-analytics:latest"
+
+    
   - name: AIRFLOW_VAR_S3_DATA_LAKE_BUCKET
     value: "de-data-lake-dev"
   - name: AIRFLOW_VAR_SNOWFLAKE_WAREHOUSE

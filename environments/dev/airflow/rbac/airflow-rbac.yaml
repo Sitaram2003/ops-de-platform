@@ -14,9 +14,7 @@ metadata:
     app.kubernetes.io/name: airflow-sa
     app.kubernetes.io/part-of: de-platform
     environment: dev
-  annotations:
-    eks.amazonaws.com/role-arn: "arn:aws:iam::123456789012:role/AirflowRole-Dev"
-    eks.amazonaws.com/token-expiration: "86400"
+
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -93,4 +91,4 @@ roleRef:
   kind: Role
   name: airflow-spark-submitter
   apiGroup: rbac.authorization.k8s.io
-</content>
+
