@@ -29,7 +29,7 @@ dags:
     enabled: false
   gitSync:
     enabled: true
-    repo: git@github.com:Sitaramu2003/ops-de-jobs.git   # DAGs live in de-jobs, not de-platform
+    repo: git@github.com:Sitaram2003/ops-de-jobs.git   # DAGs live in de-jobs, not de-platform
     branch: main   # trunk-based: all envs pull DAGs from main; diff is image tags, not branches
     rev: HEAD
     depth: 1
@@ -87,10 +87,6 @@ webserverSecretKeySecretName: airflow-webserver-secret
 # ── PostgreSQL — emptyDir in dev (data lost on pod restart, intentional) ──────
 postgresql:
   enabled: true
-  image:
-    registry: docker.io
-    repository: bitnami/postgresql
-    tag: 16.1
   auth:
     existingSecret: airflow-postgres-secret
     secretKeys:

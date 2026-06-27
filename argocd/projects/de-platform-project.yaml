@@ -29,7 +29,7 @@ spec:
   # ─── Allowed Source Repositories ─────────────────────────────────────────
   # PLACEHOLDER: replace with your actual Git repo URL
   sourceRepos:
-    - "https://github.com/<ORG>/de-platform.git"
+    - "https://github.com/Sitaramu2003/ops-de-platform.git"
     - "https://charts.strimzi.io"            # Strimzi Helm repo
     - "https://strimzi.io/charts/"           # Strimzi Helm repo (alternate)
     - "https://kedacore.github.io/charts"    # KEDA Helm repo
