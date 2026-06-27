@@ -1,0 +1,99 @@
+# =============================================================================
+# PROD KAFKA NODE POOL — KRAFT CONTROLLER
+# =============================================================================
+# KRaft controllers handle ONLY cluster metadata (Raft log, partition leadership,
+# ISR tracking). They NEVER store topic data — that's the broker pool's job.
+#
+# Why separate controller pool?
+#   If controllers and brokers share nodes, a broker GC pause could delay
+#   Raft heartbeats → false leader election → unnecessary partition rebalance.
+#   Separation: controllers run undisturbed, brokers can GC without affecting metadata.
+#
+# Quorum sizing:
+#   3 controllers: tolerates 1 failure, majority = 2
+#   5 controllers: tolerates 2 failures — for critical production, use 5
+#   This config uses 3 (industry standard for most deployments).
+#   Raft election timeout: ~2s → cluster recovers leadership within 2s of controller failure.
+#
+# IMPORTANT: NEVER change replicas on this pool without understanding Raft membership changes.
+# Strimzi handles the membership change protocol automatically on scale, but validate first.
+# =============================================================================
+
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaNodePool
+metadata:
+  name: controller
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: de-kafka-cluster
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+spec:
+  replicas: 3                        # Raft quorum — MUST be odd. Fixed in EKS node group too.
+
+  roles:
+    - controller                     # Metadata-only. Does NOT hold partition data.
+
+  storage:
+    type: jbod
+    volumes:
+      - id: 0
+        type: persistent-claim
+        size: 20Gi                   # Controllers store only Raft log + metadata (< 1GB typical)
+                                     # 20Gi is generous — provides room for metadata growth
+        class: gp3-encrypted         # Standard gp3 — controllers don't need high IOPS
+        deleteClaim: false           # Preserve controller metadata across pod restarts
+
+  resources:
+    requests:
+      memory: 4Gi
+      cpu: "1"
+    limits:
+      memory: 8Gi
+      cpu: "2"
+
+  jvmOptions:
+    -Xms: 2048m                      # 2GB initial heap (controller heap = mostly Raft log + metadata)
+    -Xmx: 4096m                      # 4GB max heap
+    gcLoggingEnabled: true
+    javaSystemProperties:
+      - name: jdk.tls.rejectClientInitiatedRenegotiation
+        value: "true"
+
+  template:
+    pod:
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: kafka-controller
+          effect: NoSchedule
+
+      affinity:
+        # REQUIRED anti-affinity: controller pods MUST be on different nodes
+        # If two controllers share a node and that node dies → we lose quorum majority
+        # Required (not preferred) because Raft quorum is non-negotiable
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  strimzi.io/pool-name: controller
+              topologyKey: kubernetes.io/hostname   # Different EC2 instance per controller
+
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    strimzi.io/pool-name: controller
+                topologyKey: topology.kubernetes.io/zone   # Different AZ per controller
+
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: role
+                    operator: In
+                    values:
+                      - kafka-controller
+
+      terminationGracePeriodSeconds: 30

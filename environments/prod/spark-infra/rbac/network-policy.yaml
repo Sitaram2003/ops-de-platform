@@ -1,0 +1,82 @@
+# =============================================================================
+# NETWORK POLICIES — Spark Namespace (Prod)
+# =============================================================================
+# Spark jobs use direct pod-to-pod communication for:
+#   Driver → Executor: task scheduling (port 7078 driver RPC endpoint)
+#   Executor → Driver: shuffle data + heartbeats (port 7079 block manager)
+#   Driver UI: SparkUI ephemeral web server (port 4040) — for debugging only
+#
+# Note: Airflow submitting SparkApplication CRs to the K8s API server is NOT
+# pod-to-pod communication — it goes through the cluster API endpoint. No
+# NetworkPolicy is needed to allow that cross-namespace call.
+# =============================================================================
+
+# Default deny: block all ingress from outside spark namespace.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: spark
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+  annotations:
+    argocd.argoproj.io/sync-wave: "+5"
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+
+---
+# Allow intra-namespace: driver ↔ executor RPC, shuffle data transfer,
+# executor heartbeats, and spark-operator → driver/executor management.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-intra-namespace
+  namespace: spark
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+  annotations:
+    argocd.argoproj.io/sync-wave: "+5"
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {}    # Any pod in spark namespace (driver, executor, operator)
+      ports:
+        - port: 7078    # Driver RPC endpoint (executors report to this)
+          protocol: TCP
+        - port: 7079    # Block manager (shuffle data exchange)
+          protocol: TCP
+        - port: 4040    # SparkUI (driver web server — ephemeral, for port-forward)
+          protocol: TCP
+
+---
+# Allow Prometheus to scrape spark-operator metrics (fleet-level job counts).
+# The spark-operator Service exposes port 10254.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-scraping
+  namespace: spark
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+  annotations:
+    argocd.argoproj.io/sync-wave: "+5"
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: spark-operator
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 10254    # spark-operator /metrics endpoint (ServiceMonitor target)
+          protocol: TCP
+</content>

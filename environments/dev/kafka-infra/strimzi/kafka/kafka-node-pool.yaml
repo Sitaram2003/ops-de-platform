@@ -1,0 +1,18 @@
+# Dev: single node pool handles both controller and broker roles (KRaft)
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaNodePool
+metadata:
+  name: combined
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: kafka-cluster
+spec:
+  replicas: 1
+  roles:
+    - controller
+    - broker
+  storage:
+    type: ephemeral
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits:   { cpu: 500m, memory: 1Gi  }

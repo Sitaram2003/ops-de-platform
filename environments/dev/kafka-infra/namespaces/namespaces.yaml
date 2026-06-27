@@ -1,0 +1,107 @@
+# =============================================================================
+# DEV NAMESPACES
+# =============================================================================
+# Same namespace structure as prod — ensures configs are portable.
+# Resource quotas are relaxed for faster experimentation.
+# =============================================================================
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kafka
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: dev
+    team: data-engineering
+  annotations:
+    sidecar.istio.io/inject: "false"
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kafka-connect
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: dev
+    team: data-engineering
+  annotations:
+    sidecar.istio.io/inject: "false"
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: schema-registry
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: dev
+    team: data-engineering
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: dev
+    team: platform-sre
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: external-secrets
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: dev
+    team: platform-sre
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: flink
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: dev
+    team: data-engineering
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: spark
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: dev
+    team: data-engineering
+
+---
+# Relaxed quotas for dev — allow engineers to experiment without hitting limits
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: kafka-quota
+  namespace: kafka
+spec:
+  hard:
+    requests.cpu: "20"
+    requests.memory: "100Gi"
+    limits.cpu: "50"
+    limits.memory: "200Gi"
+    persistentvolumeclaims: "20"
+    pods: "20"
+
+---
+# ─── Airflow Namespace (Dev) ──────────────────────────────────────────────────
+# No resource quota in dev — engineers need flexibility to test DAGs and tasks.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: airflow
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: dev
+    team: data-engineering

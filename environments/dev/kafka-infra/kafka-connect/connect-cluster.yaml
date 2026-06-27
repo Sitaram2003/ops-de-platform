@@ -1,0 +1,164 @@
+# =============================================================================
+# DEV KAFKA CONNECT CLUSTER — MINIMAL SCALE
+# =============================================================================
+# 1 Connect worker (vs 3 in prod). No HA — acceptable for dev.
+# Smaller resources, dev S3 bucket, dev Schema Registry endpoint.
+# Same ESO env var pattern — validates credential injection before prod deploy.
+# =============================================================================
+
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaConnect
+metadata:
+  name: de-connect-cluster
+  namespace: kafka-connect
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: dev
+  annotations:
+    strimzi.io/use-connector-resources: "true"
+
+spec:
+  version: 3.7.0
+  replicas: 1                        # Single worker in dev (no HA)
+
+  bootstrapServers: de-kafka-cluster-kafka-tls-bootstrap.kafka:9093
+
+  tls:
+    trustedCertificates:
+      - secretName: de-kafka-cluster-cluster-ca-cert
+        certificate: ca.crt
+
+  authentication:
+    type: scram-sha-512
+    username: kafka-connect-user
+    passwordSecret:
+      secretName: kafka-connect-user
+      password: password
+
+  config:
+    config.storage.topic: connect-configs
+    config.storage.replication.factor: 1       # RF=1 in dev (single broker)
+    offset.storage.topic: connect-offsets
+    offset.storage.replication.factor: 1
+    offset.storage.partitions: 6               # Fewer partitions for dev
+    status.storage.topic: connect-status
+    status.storage.replication.factor: 1
+    status.storage.partitions: 1
+
+    key.converter: io.confluent.kafka.serializers.KafkaAvroSerializer
+    key.converter.schema.registry.url: http://apicurio-registry.schema-registry.svc:8080/apis/ccompat/v6
+    value.converter: io.confluent.kafka.serializers.KafkaAvroSerializer
+    value.converter.schema.registry.url: http://apicurio-registry.schema-registry.svc:8080/apis/ccompat/v6
+    key.converter.schemas.enable: "false"
+    value.converter.schemas.enable: "false"
+
+    offset.flush.interval.ms: 10000
+    producer.override.acks: "1"                # Dev: acks=1 (single broker, RF=1)
+    producer.override.compression.type: lz4
+
+    config.providers: env
+    config.providers.env.class: org.apache.kafka.common.config.provider.EnvVarConfigProvider
+
+  externalConfiguration:
+    env:
+      - name: POSTGRES_DB_HOSTNAME
+        valueFrom:
+          secretKeyRef:
+            name: postgres-cdc-credentials
+            key: hostname
+      - name: POSTGRES_DB_PORT
+        valueFrom:
+          secretKeyRef:
+            name: postgres-cdc-credentials
+            key: port
+      - name: POSTGRES_DB_USERNAME
+        valueFrom:
+          secretKeyRef:
+            name: postgres-cdc-credentials
+            key: username
+      - name: POSTGRES_DB_PASSWORD
+        valueFrom:
+          secretKeyRef:
+            name: postgres-cdc-credentials
+            key: password
+      - name: MYSQL_DB_HOSTNAME
+        valueFrom:
+          secretKeyRef:
+            name: mysql-cdc-credentials
+            key: hostname
+      - name: MYSQL_DB_PORT
+        valueFrom:
+          secretKeyRef:
+            name: mysql-cdc-credentials
+            key: port
+      - name: MYSQL_DB_USERNAME
+        valueFrom:
+          secretKeyRef:
+            name: mysql-cdc-credentials
+            key: username
+      - name: MYSQL_DB_PASSWORD
+        valueFrom:
+          secretKeyRef:
+            name: mysql-cdc-credentials
+            key: password
+
+  build:
+    output:
+      type: docker
+      # PLACEHOLDER: replace 123456789012 with your AWS account ID
+      image: "123456789012.dkr.ecr.ap-south-1.amazonaws.com/de-kafka-connect:dev-latest"
+    plugins:
+      - name: debezium-postgres-connector
+        artifacts:
+          - type: maven
+            group: io.debezium
+            artifact: debezium-connector-postgres
+            version: 2.6.2.Final
+      - name: debezium-mysql-connector
+        artifacts:
+          - type: maven
+            group: io.debezium
+            artifact: debezium-connector-mysql
+            version: 2.6.2.Final
+      - name: kafka-connect-s3
+        artifacts:
+          - type: maven
+            group: io.confluent
+            artifact: kafka-connect-s3
+            version: 10.7.4
+      - name: kafka-connect-avro-converter
+        artifacts:
+          - type: maven
+            group: io.confluent
+            artifact: kafka-connect-avro-converter
+            version: 7.6.1
+
+  resources:
+    requests:
+      memory: 1Gi
+      cpu: "0.5"
+    limits:
+      memory: 4Gi
+      cpu: "2"
+
+  jvmOptions:
+    -Xms: 512m
+    -Xmx: 2048m
+
+  template:
+    pod:
+      serviceAccountName: kafka-connect-sa
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: kafka-connect
+          effect: NoSchedule
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: role
+                    operator: In
+                    values:
+                      - kafka-connect

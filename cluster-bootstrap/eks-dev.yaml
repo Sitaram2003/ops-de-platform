@@ -1,0 +1,187 @@
+# =============================================================================
+# DEVELOPMENT EKS CLUSTER — eksctl ClusterConfig
+# =============================================================================
+# Deploy:  eksctl create cluster -f environments/dev/eks-cluster.yaml
+# Teardown: eksctl delete cluster -f environments/dev/eks-cluster.yaml
+#
+# Design principles for dev:
+#   • Minimal cost — smaller instances, min replicas reduced to 1
+#   • Scale from 0 — Flink and Spark node groups start at 0 pods, scale on demand
+#   • Same topology as prod — validates configs before prod deploy
+#   • No tiered storage — dev data doesn't need long retention
+#   • Flink/Spark nodes: 0 minimum — only provisioned when testing jobs
+#
+# Monthly cost estimate (ap-south-1, on-demand):
+#   Baseline (no jobs running): ~$400-600/month
+#   With Flink/Spark jobs:      ~$800-1200/month
+#   vs Prod baseline:           ~$3000-5000/month
+# =============================================================================
+
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: de-platform-dev           # PLACEHOLDER: see config/placeholders.yaml → eks.dev.cluster_name
+  region: ap-south-1
+  version: "1.31"
+
+iam:
+  withOIDC: true
+
+addons:
+  - name: aws-ebs-csi-driver
+    version: latest
+    attachPolicyARNs:
+      - arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy
+  - name: vpc-cni
+    version: latest
+  - name: coredns
+    version: latest
+  - name: kube-proxy
+    version: latest
+
+managedNodeGroups:
+
+  # ── 1. OPERATORS NODE GROUP ───────────────────────────────────────────────
+  # t3.medium: 2 vCPU, 4GB — smallest viable for K8s system pods + operators
+  # Strimzi + ESO + ArgoCD agent + cert-manager together use ~2GB RAM
+  - name: operators-ng
+    instanceType: t3.medium
+    minSize: 2
+    maxSize: 2                    # Fixed — operators are always-on
+    availabilityZones:
+      - ap-south-1a
+      - ap-south-1b
+    labels:
+      role: operators
+      environment: dev
+    taints:
+      - key: dedicated
+        value: operators
+        effect: NoSchedule
+
+  # ── 2. MONITORING NODE GROUP ──────────────────────────────────────────────
+  # t3.xlarge: 4 vCPU, 16GB — sufficient for Prometheus (4GB) + Grafana + Alertmanager
+  # Dev retention: 7 days (vs 15 days prod) — Prometheus TSDB footprint smaller
+  - name: monitoring-ng
+    instanceType: t3.xlarge
+    minSize: 1
+    maxSize: 2
+    availabilityZones:
+      - ap-south-1a
+      - ap-south-1b
+    labels:
+      role: monitoring
+      environment: dev
+    taints:
+      - key: dedicated
+        value: monitoring
+        effect: NoSchedule
+
+  # ── 3. KAFKA BROKER NODE GROUP ────────────────────────────────────────────
+  # r5.xlarge: 4 vCPU, 32GB — 1 broker pod per node (dev = 1 broker minimum)
+  # Dev: RF=1 topics, no tiered storage, 100Gi EBS volumes
+  # minSize: 1 → always 1 broker. Scale to 3 for HA testing.
+  - name: kafka-brokers-ng
+    instanceType: r5.xlarge
+    minSize: 1
+    maxSize: 3
+    availabilityZones:
+      - ap-south-1a
+      - ap-south-1b
+    labels:
+      role: kafka-broker
+      environment: dev
+    taints:
+      - key: dedicated
+        value: kafka-broker
+        effect: NoSchedule
+    iam:
+      withAddonPolicies:
+        autoScaler: true
+
+  # ── 4. KAFKA CONTROLLER NODE GROUP ───────────────────────────────────────
+  # m5.large: 2 vCPU, 8GB — 1 KRaft controller (dev only — not HA)
+  # In dev, 1 controller is acceptable (saves cost). For HA testing, scale to 3.
+  # NOTE: If testing Raft quorum behavior, temporarily set min/maxSize to 3.
+  - name: kafka-controllers-ng
+    instanceType: m5.large
+    minSize: 1
+    maxSize: 1                    # Fixed at 1 for dev (3 in prod for Raft quorum)
+    availabilityZones:
+      - ap-south-1a
+    labels:
+      role: kafka-controller
+      environment: dev
+    taints:
+      - key: dedicated
+        value: kafka-controller
+        effect: NoSchedule
+
+  # ── 5. FLINK NODE GROUP ───────────────────────────────────────────────────
+  # r5.xlarge: 4 vCPU, 32GB — floor(28GB/8GB per TM) = 3 TM pods per node
+  # minSize: 0 → scale from 0 (Flink jobs are triggered, not always running)
+  # KEDA ScaledObject with activationLagThreshold activates from 0 when lag appears
+  - name: flink-ng
+    instanceType: r5.xlarge
+    minSize: 0                    # Scale from 0 — Cluster Autoscaler provisions node when KEDA adds pods
+    maxSize: 6                    # 6 nodes × 3 TMs = 18 TM slots (dev traffic)
+    availabilityZones:
+      - ap-south-1a
+      - ap-south-1b
+    labels:
+      role: flink
+      environment: dev
+    taints:
+      - key: dedicated
+        value: flink
+        effect: NoSchedule
+    iam:
+      withAddonPolicies:
+        autoScaler: true
+
+  # ── 6. SPARK NODE GROUP ───────────────────────────────────────────────────
+  # m5.xlarge: 4 vCPU, 16GB — 1 Spark executor per node in dev
+  # minSize: 0 → Spark is batch, runs on schedule, no need to keep nodes warm
+  - name: spark-ng
+    instanceTypes:
+      - m5.xlarge
+      - m5a.xlarge
+      - m4.xlarge
+    spot: true                     # Dev Spark: Spot to minimize cost (interruptions OK in dev)
+    minSize: 0
+    maxSize: 4
+    availabilityZones:
+      - ap-south-1a
+      - ap-south-1b
+    labels:
+      role: spark
+      environment: dev
+    taints:
+      - key: dedicated
+        value: spark
+        effect: NoSchedule
+    iam:
+      withAddonPolicies:
+        autoScaler: true
+
+  # ── 7. KAFKA CONNECT NODE GROUP ───────────────────────────────────────────
+  # c5.large: 2 vCPU, 4GB — 1 Connect worker pod per node in dev
+  # Handles Debezium CDC (dev DB) + S3 Sink (dev S3 bucket)
+  - name: kafka-connect-ng
+    instanceType: c5.large
+    minSize: 1
+    maxSize: 3
+    availabilityZones:
+      - ap-south-1a
+      - ap-south-1b
+    labels:
+      role: kafka-connect
+      environment: dev
+    taints:
+      - key: dedicated
+        value: kafka-connect
+        effect: NoSchedule
+    iam:
+      withAddonPolicies:
+        autoScaler: true

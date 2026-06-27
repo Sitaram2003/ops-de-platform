@@ -1,0 +1,23 @@
+# Debezium PostgreSQL CDC connector — Dev
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaConnector
+metadata:
+  name: debezium-postgres-dev
+  namespace: kafka-connect
+  labels:
+    strimzi.io/cluster: kafka-connect-cluster
+spec:
+  class: io.debezium.connector.postgresql.PostgresConnector
+  tasksMax: 1
+  config:
+    database.hostname: postgres-dev.internal
+    database.port: "5432"
+    database.user: debezium
+    database.password: ${file:/opt/kafka/external-configuration/debezium-postgres-secret/password}
+    database.dbname: appdb
+    database.server.name: dev-postgres
+    topic.prefix: cdc
+    table.include.list: public.transactions, public.users
+    plugin.name: pgoutput
+    slot.name: debezium_dev
+    publication.name: dbz_publication_dev

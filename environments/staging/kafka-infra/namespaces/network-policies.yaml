@@ -1,0 +1,294 @@
+# =============================================================================
+# NETWORK POLICIES — Staging
+# =============================================================================
+# Identical structure to prod — default-deny ingress + targeted allow rules.
+# staging label applied throughout for easy filtering.
+# =============================================================================
+
+# ─── KAFKA NAMESPACE ──────────────────────────────────────────────────────────
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: kafka
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+  annotations:
+    argocd.argoproj.io/sync-wave: "+5"
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-intra-namespace
+  namespace: kafka
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+  annotations:
+    argocd.argoproj.io/sync-wave: "+5"
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {}
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-from-kafka-connect
+  namespace: kafka
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+  annotations:
+    argocd.argoproj.io/sync-wave: "+5"
+spec:
+  podSelector:
+    matchLabels:
+      strimzi.io/kind: Kafka
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kafka-connect
+      ports:
+        - port: 9093
+          protocol: TCP
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-scraping
+  namespace: kafka
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+  annotations:
+    argocd.argoproj.io/sync-wave: "+5"
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 9096
+          protocol: TCP
+        - port: 9404
+          protocol: TCP
+
+---
+# ─── KAFKA CONNECT NAMESPACE ──────────────────────────────────────────────────
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: kafka-connect
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+  annotations:
+    argocd.argoproj.io/sync-wave: "+5"
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-intra-namespace
+  namespace: kafka-connect
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+  annotations:
+    argocd.argoproj.io/sync-wave: "+5"
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {}
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-scraping
+  namespace: kafka-connect
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+  annotations:
+    argocd.argoproj.io/sync-wave: "+5"
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 9096
+          protocol: TCP
+
+---
+# ─── SCHEMA REGISTRY NAMESPACE ───────────────────────────────────────────────
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: schema-registry
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+  annotations:
+    argocd.argoproj.io/sync-wave: "+5"
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-intra-namespace
+  namespace: schema-registry
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+  annotations:
+    argocd.argoproj.io/sync-wave: "+5"
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {}
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-schema-consumers
+  namespace: schema-registry
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+  annotations:
+    argocd.argoproj.io/sync-wave: "+5"
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kafka-connect
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kafka
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: flink
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: spark
+      ports:
+        - port: 8081
+          protocol: TCP
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-scraping
+  namespace: schema-registry
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+  annotations:
+    argocd.argoproj.io/sync-wave: "+5"
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 8081
+          protocol: TCP
+
+---
+# ─── MONITORING NAMESPACE ─────────────────────────────────────────────────────
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+  annotations:
+    argocd.argoproj.io/sync-wave: "+5"
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-intra-namespace
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+  annotations:
+    argocd.argoproj.io/sync-wave: "+5"
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {}
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-grafana-ui
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+  annotations:
+    argocd.argoproj.io/sync-wave: "+5"
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: grafana
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        - port: 3000
+          protocol: TCP

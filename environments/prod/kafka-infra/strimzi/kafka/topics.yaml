@@ -1,0 +1,183 @@
+# =============================================================================
+# PROD KAFKA TOPICS
+# =============================================================================
+# All topics managed declaratively as KafkaTopic CRs.
+# Strimzi TopicOperator reconciles these to the actual Kafka cluster.
+# Changes here are applied safely (incremental broker-side operations).
+#
+# Partition sizing rule (Netflix/Uber standard):
+#   partitions = max(desired_consumer_parallelism, desired_producer_throughput / partition_throughput)
+#   For high-throughput topics: 1 partition per Flink TaskManager (KEDA scales TMs up to partitions)
+#
+# Replication = 3 in prod (min.isr=2 → acks=-1 = zero message loss guarantee)
+# Retention: per-topic, driven by downstream recovery window requirements
+# =============================================================================
+
+# ─── 1. CLICKSTREAM EVENTS ────────────────────────────────────────────────────
+# Source: Mobile/web app clickstream events (page views, button clicks, purchases)
+# Volume: Up to 500K events/sec during flash sales (Diwali, Big Billion Day)
+# Consumers: Flink real-time processing, S3 Sink for Spark batch analytics
+# Design: 120 partitions → supports 120 parallel Flink TaskManagers at peak
+#   Each partition handles: 500K / 120 = ~4.2K events/sec (well within 10K per-partition limit)
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: app-clickstream-events
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: de-kafka-cluster
+    app.kubernetes.io/part-of: de-platform
+    source: clickstream
+    environment: prod
+spec:
+  topicName: app.clickstream.events  # Dots in topic names require separate topicName field
+  partitions: 120
+  replicas: 3
+  config:
+    min.insync.replicas: "2"
+    retention.ms: "604800000"        # 7 days — Flink job replay window (recover from 1-week lag)
+    cleanup.policy: delete
+    compression.type: lz4
+    # Tiered storage — hot data on broker, cold on S3
+    remote.storage.enable: "true"
+    local.retention.ms: "21600000"   # 6 hours hot on broker, rest on S3
+    # Segment tuning: 256MB segments for clickstream (small events, high partition count)
+    # Smaller segments → faster S3 upload, faster deletion of expired data
+    segment.bytes: "268435456"       # 256MB
+    # Max message size: 10MB (clickstream events are small, but allow for occasional large payloads)
+    max.message.bytes: "10485760"
+
+---
+# ─── 2. CDC TRANSACTIONS ──────────────────────────────────────────────────────
+# Source: Debezium PostgreSQL CDC (orders, users, products, payments, inventory tables)
+# Volume: Up to 50K CDC events/sec during flash sales
+# Consumers: Flink CDC enrichment, S3 Sink for historical CDC replay
+# Design: Compacted log (keeps latest record per primary key)
+#   Flink CDC join can always read latest DB state from this topic without full DB scan.
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: cdc-transactions-db
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: de-kafka-cluster
+    app.kubernetes.io/part-of: de-platform
+    source: cdc
+    environment: prod
+spec:
+  topicName: cdc.postgres-app-db
+  partitions: 60                     # Matches max DB shards/connections Debezium can handle
+  replicas: 3
+  config:
+    min.insync.replicas: "2"
+    # compact: keeps latest record per key (primary key of each DB row)
+    # delete: also need delete to expire tombstones after delete.retention.ms
+    # compact,delete: both semantics — compaction + old tombstone deletion
+    cleanup.policy: compact,delete
+    segment.ms: "3600000"            # Compact segments older than 1 hour
+    delete.retention.ms: "86400000"  # Keep tombstones 24h (for consumers that missed deletes)
+    min.cleanable.dirty.ratio: "0.5" # Compact when 50% of log is dirty (uncompacted)
+    # No tiered storage for CDC: compacted topics have complex tiered storage semantics
+    # The compaction log cleaner must run locally before S3 upload
+    max.message.bytes: "5242880"     # 5MB — CDC row snapshots can be large for wide tables
+
+---
+# ─── 3. GPS LOCATION EVENTS ───────────────────────────────────────────────────
+# Source: GPS tracking events from mobile apps (delivery drivers, ride-hailing)
+# Volume: Up to 2M events/sec from millions of active devices during peak
+# Consumers: Flink geofencing, ETA calculation, S3 Sink for route analytics
+# Design: 240 partitions — highest parallelism for highest-volume topic
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: gps-location-events
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: de-kafka-cluster
+    app.kubernetes.io/part-of: de-platform
+    source: gps
+    environment: prod
+spec:
+  topicName: app.gps.location.events
+  partitions: 240                    # 240 = max Flink TM slots × 2 (GPS needs highest parallelism)
+  replicas: 3
+  config:
+    min.insync.replicas: "2"
+    retention.ms: "86400000"         # 1 day — GPS data is highly time-sensitive, no need for 7 days
+    cleanup.policy: delete
+    compression.type: lz4
+    # Small events (GPS = ~100 bytes per event)
+    segment.bytes: "268435456"       # 256MB segments
+    remote.storage.enable: "true"
+    local.retention.ms: "3600000"    # 1 hour hot — GPS consumers are real-time
+    max.message.bytes: "1048576"     # 1MB — GPS events are tiny
+
+---
+# ─── 4. MICROSERVICE EVENTS ───────────────────────────────────────────────────
+# Source: Various microservice events (order_placed, payment_processed, delivery_updated, etc.)
+# Volume: Moderate — ~10K events/sec during peak
+# Consumers: Flink event-driven workflows, Spark daily reporting
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: microservice-events
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: de-kafka-cluster
+    app.kubernetes.io/part-of: de-platform
+    source: microservices
+    environment: prod
+spec:
+  topicName: app.microservice.events
+  partitions: 60                     # 60 — lower volume than clickstream, fewer TMs needed
+  replicas: 3
+  config:
+    min.insync.replicas: "2"
+    retention.ms: "604800000"        # 7 days — microservice events often need replay for auditing
+    cleanup.policy: delete
+    compression.type: lz4
+    remote.storage.enable: "true"
+    local.retention.ms: "21600000"   # 6 hours
+    max.message.bytes: "5242880"     # 5MB — events can include embedded payloads
+
+---
+# ─── 5. DLQ TOPICS (Dead Letter Queues) ─────────────────────────────────────
+# Receive malformed/unprocessable events from connectors and Flink
+# Data quality team monitors these for schema drift, serialization errors
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: dlq-cdc-postgres
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: de-kafka-cluster
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+spec:
+  topicName: dlq.cdc.postgres-app-db
+  partitions: 3                      # DLQ traffic is low — 3 partitions is sufficient
+  replicas: 3
+  config:
+    min.insync.replicas: "2"
+    retention.ms: "2592000000"       # 30 days — DLQ events need manual review before deletion
+    cleanup.policy: delete
+    max.message.bytes: "10485760"
+
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: dlq-s3-sink-clickstream
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: de-kafka-cluster
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+spec:
+  topicName: dlq.s3-sink.clickstream
+  partitions: 3
+  replicas: 3
+  config:
+    min.insync.replicas: "2"
+    retention.ms: "2592000000"       # 30 days
+    cleanup.policy: delete

@@ -1,0 +1,125 @@
+# =============================================================================
+# PROD DEBEZIUM POSTGRESQL CDC CONNECTOR
+# =============================================================================
+# Reads PostgreSQL WAL (Write-Ahead Log) → produces CDC events to Kafka.
+#
+# Phase 1 (SNAPSHOT): On first start, reads entire whitelisted tables and
+# publishes each row as an INSERT event. Establishes baseline state.
+# Phase 2 (STREAMING): Subscribes to WAL via logical replication slot.
+# Every INSERT/UPDATE/DELETE in DB → immediate Kafka message.
+#
+# Credentials are NOT hardcoded here — they are injected via environment
+# variables from K8s Secrets (populated by ESO from Secrets Manager).
+# See: environments/prod/kafka-infra/kafka-connect/connect-cluster.yaml
+#      spec.externalConfiguration.env
+#
+# RDS prerequisites (run once on PostgreSQL before first deploy):
+#   -- Enable logical replication (wal_level=logical in RDS parameter group)
+#   CREATE PUBLICATION debezium_pub FOR TABLE
+#     public.orders, public.users, public.products, public.payments, public.inventory;
+#   CREATE USER debezium_user REPLICATION LOGIN PASSWORD '<password>';
+#   GRANT SELECT ON ALL TABLES IN SCHEMA public TO debezium_user;
+# =============================================================================
+
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaConnector
+metadata:
+  name: debezium-postgres-transactions
+  namespace: kafka-connect
+  labels:
+    strimzi.io/cluster: de-connect-cluster
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+spec:
+  class: io.debezium.connector.postgresql.PostgresConnector
+
+  # tasksMax: ALWAYS 1 for PostgreSQL.
+  # WHY? PostgreSQL WAL is a single ordered stream per replication slot.
+  # Multiple tasks reading the same WAL = out-of-order events = broken CDC ordering.
+  # (MySQL with multi-source supports > 1 task — see debezium-mysql-cdc.yaml)
+  tasksMax: 1
+
+  config:
+    # ─── Database Connection (injected from ESO secrets via env vars) ──────
+    # ${env:VAR_NAME} syntax uses the EnvVarConfigProvider registered in connect-cluster.yaml
+    database.hostname: "${env:POSTGRES_DB_HOSTNAME}"
+    database.port: "${env:POSTGRES_DB_PORT}"
+    database.user: "${env:POSTGRES_DB_USERNAME}"
+    database.password: "${env:POSTGRES_DB_PASSWORD}"
+    database.dbname: "app_db"                         # Non-sensitive — safe to hardcode
+    database.server.name: "postgres-app-db"           # Topic prefix identifier
+    # Topics created: cdc.postgres-app-db.public.orders, cdc.postgres-app-db.public.users, etc.
+
+    # ─── Replication Slot ─────────────────────────────────────────────────
+    # CRITICAL: The slot keeps PostgreSQL from discarding WAL that Debezium hasn't read yet.
+    # Without slot: PostgreSQL discards WAL → Debezium restart finds missing WAL → FATAL error
+    # With slot: WAL retained until Debezium acknowledges reading it (via slot's confirmed_flush_lsn)
+    # Monitor: SELECT * FROM pg_replication_slots; — slot lag should stay low (< 1GB)
+    slot.name: "debezium_slot_app_db"
+    plugin.name: pgoutput               # Built into PostgreSQL 10+ — no extension needed on RDS
+    publication.name: "debezium_pub"    # PostgreSQL publication (created in prerequisites above)
+
+    # ─── Snapshot ─────────────────────────────────────────────────────────
+    # initial: snapshot once on first start, then stream. Production standard.
+    snapshot.mode: initial
+    snapshot.isolation.mode: repeatable_read  # Consistent point-in-time snapshot
+    snapshot.fetch.size: 10240           # Fetch 10K rows per JDBC batch during snapshot
+
+    # ─── Table & Column Filtering ─────────────────────────────────────────
+    # Whitelist: ONLY capture these tables (explicit for security + performance)
+    table.include.list: "public.orders,public.users,public.products,public.payments,public.inventory"
+
+    # Exclude PII columns — GDPR compliance: these fields never flow through Kafka
+    # They appear as null in the Kafka message.
+    column.exclude.list: "public.users.password_hash,public.users.ssn,public.users.credit_card_number"
+
+    # ─── Topic Routing ────────────────────────────────────────────────────
+    topic.prefix: "cdc"
+    # Result: cdc.postgres-app-db.public.orders, cdc.postgres-app-db.public.users, etc.
+
+    # ─── Heartbeat ────────────────────────────────────────────────────────
+    # Problem: During quiet periods (no DB changes), Debezium doesn't advance WAL position.
+    # PostgreSQL can't clean up old WAL → replication slot lag grows → disk fills.
+    # Solution: heartbeat every 30s → advances confirmed_flush_lsn → PostgreSQL cleans WAL.
+    heartbeat.interval.ms: 30000
+    heartbeat.topics.prefix: "__debezium-heartbeat"
+
+    # ─── Single Message Transforms (SMTs) ────────────────────────────────
+    # Applied in order: unwrap → addEventTimestamp → filterHeartbeat
+    transforms: "unwrap,addEventTimestamp,filterHeartbeat"
+
+    # SMT 1: ExtractNewRecordState — flatten Debezium envelope
+    # Without: message = {before:{...}, after:{...}, op:'u', source:{...}} (nested, complex)
+    # With:    message = {id:1, status:'shipped', ...} + metadata fields
+    # Flink SQL, Spark SQL work with flat records — unwrap is essential.
+    transforms.unwrap.type: io.debezium.transforms.ExtractNewRecordState
+    transforms.unwrap.drop.tombstones: "false"       # Keep tombstones for compacted topics
+    transforms.unwrap.delete.handling.mode: rewrite  # Emit 'before' values on DELETE with __deleted=true
+    transforms.unwrap.add.fields: "op,ts_ms,db,table"
+    transforms.unwrap.add.headers: "op"
+
+    # SMT 2: Add event_timestamp header (DB transaction time, not Kafka ingestion time)
+    # Flink uses this header for event-time watermarks (crucial for time-window aggregations)
+    transforms.addEventTimestamp.type: org.apache.kafka.connect.transforms.InsertHeader
+    transforms.addEventTimestamp.header: "event_timestamp"
+    transforms.addEventTimestamp.value.literal: "${ts_ms}"
+
+    # SMT 3: Filter out heartbeat events from data topics
+    # Heartbeats (op=h) keep the replication slot alive but shouldn't be processed downstream
+    transforms.filterHeartbeat.type: io.debezium.transforms.Filter
+    transforms.filterHeartbeat.condition: "value.op != 'h'"
+
+    # ─── Error Handling ───────────────────────────────────────────────────
+    # tolerance: all — malformed events → DLQ, connector continues running
+    # Alternative: 'none' → any bad event stops connector (noisy, causes lag)
+    errors.tolerance: all
+    errors.deadletterqueue.topic.name: dlq.cdc.postgres-app-db
+    errors.deadletterqueue.context.headers.enable: "true"
+    errors.deadletterqueue.topic.replication.factor: "3"
+
+    # ─── Exactly-Once Delivery ────────────────────────────────────────────
+    # Debezium 2.5+: uses Kafka transactions to prevent duplicate events on restart/crash
+    # Without: network blip between Debezium and Kafka → duplicate INSERT events
+    #          → duplicate rows in DynamoDB/Redis serving layer
+    exactly.once.support: required
+    transaction.boundary: transaction   # Group DB transaction events into one Kafka transaction

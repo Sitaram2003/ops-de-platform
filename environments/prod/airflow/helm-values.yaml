@@ -1,0 +1,157 @@
+# =============================================================================
+# AIRFLOW HELM VALUES — Prod
+# =============================================================================
+# Consumed by the ArgoCD multi-source Application in operator/airflow-app.yaml
+# via $values/environments/prod/airflow/helm-values.yaml.
+#
+# DAG delivery: git-sync sidecar clones this repo, exposes airflow/ subdir.
+#   Scheduler + webserver both mount the shared emptyDir at /opt/airflow/dags.
+#   Symlink path: /opt/airflow/dags/repo/HEAD → airflow/ directory of the repo.
+#   dags_folder  = /opt/airflow/dags/repo/HEAD/dags
+#   TEMPLATES_DIR = /opt/airflow/dags/repo/HEAD/spark-templates  (read by DAG)
+# =============================================================================
+
+executor: KubernetesExecutor
+
+# ── Airflow config overrides ──────────────────────────────────────────────────
+config:
+  core:
+    dags_are_paused_at_creation: "true"    # New DAGs start paused — enable manually
+    load_examples: "false"
+    dags_folder: /opt/airflow/dags/repo/HEAD/dags
+  kubernetes_executor:
+    namespace: airflow
+    worker_service_account_name: airflow-sa
+    worker_pods_creation_batch_size: "5"   # Max task pods created per scheduler loop
+  logging:
+    remote_logging: "true"
+    remote_base_log_folder: "s3://de-data-lake-prod/airflow-logs/"
+    remote_log_conn_id: "aws_default"
+
+# ── DAGs via git-sync ─────────────────────────────────────────────────────────
+# git-sync sidecar runs alongside scheduler and webserver. Clones the repo,
+# atomically updates the symlink on each new commit. Period 60s = max 1-min lag.
+# subPath: airflow → only the airflow/ subtree is exposed under repo/HEAD/
+dags:
+  persistence:
+    enabled: false
+  gitSync:
+    enabled: true
+    repo: git@github.com:your-org/de-jobs.git   # DAGs live in de-jobs, not de-platform
+    branch: main
+    rev: HEAD
+    depth: 1
+    subPath: airflow   # exposes de-jobs/airflow/ → repo/HEAD/; dags_folder = repo/HEAD/dags
+    sshKeySecret: git-credentials   # ESO syncs this — see external-secrets/airflow-secrets.yaml
+    period: 60s
+    containerName: git-sync
+
+# ── Scheduler ─────────────────────────────────────────────────────────────────
+scheduler:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+# ── Webserver ─────────────────────────────────────────────────────────────────
+webserver:
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+  service:
+    type: ClusterIP    # Expose via kubectl port-forward or Ingress
+  defaultUser:
+    enabled: true
+    role: Admin
+    username: admin
+    email: de-platform@company.com
+    firstName: Airflow
+    lastName: Admin
+    password: ~        # Overridden by webserverSecretKeySecretName
+
+# ── Triggerer (required for deferrable operators) ─────────────────────────────
+triggerer:
+  enabled: true
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# ── Security (secrets from ESO ExternalSecrets) ───────────────────────────────
+fernetKeySecretName: airflow-fernet-key
+webserverSecretKeySecretName: airflow-webserver-secret
+
+# ── PostgreSQL (metadata DB) ──────────────────────────────────────────────────
+postgresql:
+  enabled: true
+  auth:
+    existingSecret: airflow-postgres-secret
+    secretKeys:
+      adminPasswordKey: postgresql-password
+  primary:
+    persistence:
+      enabled: true
+      storageClass: gp3-general
+      size: 20Gi
+    resources:
+      requests:
+        cpu: 500m
+        memory: 512Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi
+
+# ── Service account ───────────────────────────────────────────────────────────
+# Managed in rbac/airflow-rbac.yaml — chart must not create a new one.
+serviceAccount:
+  create: false
+  name: airflow-sa
+
+# ── Node placement: operators-ng ──────────────────────────────────────────────
+tolerations:
+  - key: dedicated
+    operator: Equal
+    value: operators
+    effect: NoSchedule
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: role
+              operator: In
+              values:
+                - operators
+
+# ── Airflow Variables (injected as environment variables) ─────────────────────
+# These are mounted as K8s env vars → Airflow Variable API reads them at runtime.
+# DAGs access via: Variable.get("S3_DATA_LAKE_BUCKET")
+# SparkApplication templates use these for job sizing and output paths.
+env:
+  - name: AIRFLOW_VAR_SPARK_DQ_REPORT_IMAGE
+    value: "PLACEHOLDER_ECR/spark-dq-report:latest"
+  - name: AIRFLOW_VAR_SPARK_CLICKSTREAM_AGG_IMAGE
+    value: "PLACEHOLDER_ECR/spark-clickstream-agg:latest"
+  - name: AIRFLOW_VAR_SPARK_TRANSACTION_ANALYTICS_IMAGE
+    value: "PLACEHOLDER_ECR/spark-transaction-analytics:latest"
+  - name: AIRFLOW_VAR_S3_DATA_LAKE_BUCKET
+    value: "de-data-lake-prod"
+  - name: AIRFLOW_VAR_SNOWFLAKE_WAREHOUSE
+    value: "PROD_WAREHOUSE"
+  - name: AIRFLOW_VAR_SPARK_EXECUTOR_INSTANCES
+    value: "4"
+  - name: AIRFLOW_VAR_SPARK_EXECUTOR_MEMORY
+    value: "16g"
+  - name: AIRFLOW_VAR_SPARK_EXECUTOR_CORES
+    value: "4"

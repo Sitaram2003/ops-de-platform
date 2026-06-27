@@ -1,0 +1,60 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: spark-alert-rules
+  namespace: monitoring
+  labels:
+    prometheus: kube-prometheus
+    role: alert-rules
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+spec:
+  groups:
+    - name: spark.critical.failures
+      interval: 30s
+      rules:
+        - alert: SparkJobFailed
+          expr: spark_app_count{state="FAILED"} > 0
+          for: 5m
+          labels:
+            severity: critical
+            team: data-engineering
+            service: spark
+            environment: staging
+          annotations:
+            summary: "{{ $value }} Spark job(s) in FAILED state in namespace {{ $labels.namespace }}"
+            description: |
+              One or more Spark jobs have failed in staging (retries exhausted).
+              Check: kubectl get sparkapplication -n spark
+              View driver logs: kubectl logs -n spark -l spark-role=driver --tail=100
+            runbook: "https://wiki.internal/runbooks/spark/job-failed"
+
+    - name: spark.warning.health
+      interval: 30s
+      rules:
+        - alert: SparkJobRunningTooLong
+          expr: |
+            (spark_app_count{state="RUNNING"} > 0)
+            and on (namespace)
+            (time() - spark_app_submit_time > 7200)
+          for: 0m
+          labels:
+            severity: warning
+            team: data-engineering
+            service: spark
+            environment: staging
+          annotations:
+            summary: "Spark job in namespace {{ $labels.namespace }} has been running > 2 hours (staging)"
+            runbook: "https://wiki.internal/runbooks/spark/job-running-too-long"
+
+        - alert: SparkOperatorDown
+          expr: absent(spark_app_count)
+          for: 5m
+          labels:
+            severity: warning
+            team: data-engineering
+            service: spark
+            environment: staging
+          annotations:
+            summary: "spark-on-k8s-operator is not emitting metrics (staging)"
+            runbook: "https://wiki.internal/runbooks/spark/operator-down"

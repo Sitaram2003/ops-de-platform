@@ -1,0 +1,124 @@
+# =============================================================================
+# PROD KAFKA NODE POOL — BROKER
+# =============================================================================
+# This pool runs the data plane: producers write here, consumers read from here.
+# Separate from controllers — data I/O doesn't interfere with Raft metadata.
+#
+# Sizing rationale (r5.4xlarge: 16 vCPU, 128GB RAM):
+#
+#   Pod memory: request=20Gi, limit=24Gi
+#     JVM heap (-Xmx=16GB) + direct memory cap (2GB) + JVM overhead (~2GB) = ~20GB
+#     Pod limit set to 24Gi — 4GB safe buffer above JVM max consumption.
+#     The JVM does NOT grow heap beyond -Xmx=16GB. Setting limit to 64Gi does NOT
+#     benefit the JVM — it only reduces OS page cache headroom.
+#
+#   OS page cache (kernel memory — OUTSIDE pod limits):
+#     128GB node - 24GB pod limit - 2GB system = ~102GB available to OS page cache
+#     vs previous 64Gi limit: 128 - 64 - 2 = 62GB page cache (40GB LESS)
+#     Page cache is Kafka's primary read buffer — larger = fewer disk reads.
+#
+#   JBOD: 2 independent EBS volumes per broker
+#     Partition assignment round-robins across volumes.
+#     If vol-0 fails → only partitions on vol-0 go offline, not the entire broker.
+#     Volume size: 2750Gi (accounts for FOLLOWER replication writes)
+#       Leader + 2 follower writes per broker = 100MB/s total disk throughput
+#       Per volume: 100MB/s ÷ 2 = 50MB/s × 6h × 3600s × 2.5 safety = 2700GB → 2750Gi
+#
+#   Anti-affinity: REQUIRED (not preferred) — guarantees 1 broker per EC2 node.
+#     Soft rule allows co-location under node pressure → inconsistent page cache
+#     allocation. Required rule enforces the invariant at all times.
+#
+# =============================================================================
+
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaNodePool
+metadata:
+  name: broker
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: de-kafka-cluster
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+spec:
+  # 3 brokers at baseline (1 per AZ). Cruise Control + Cluster Autoscaler scale
+  # to 12 during peak (flash sales, Diwali traffic surges).
+  replicas: 3
+
+  roles:
+    - broker                         # Data plane only (controllers are separate pool)
+
+  storage:
+    type: jbod                       # JBOD: each volume is independent
+    volumes:
+      - id: 0
+        type: persistent-claim
+        # 2750Gi — sized for follower replication writes included:
+        #   100MB/s total per broker ÷ 2 volumes = 50MB/s per volume
+        #   50MB/s × 21600s × 2.5 safety = 2700GB → 2750Gi
+        # Prior value (1000Gi) only counted leader writes (33MB/s) — 2.7× undersized
+        size: 2750Gi
+        class: gp3-high-iops
+        deleteClaim: false           # NEVER auto-delete broker data PVCs
+
+      - id: 1
+        type: persistent-claim
+        size: 2750Gi                 # Second volume: Kafka round-robins partitions across volumes
+        class: gp3-high-iops
+        deleteClaim: false
+
+  resources:
+    requests:
+      memory: 20Gi                   # JVM heap ceiling + overhead. Scheduler bins on this.
+      cpu: "6"
+    limits:
+      memory: 24Gi                   # 4Gi buffer above JVM max (heap+direct+overhead ≈ 20GB)
+      cpu: "12"                      # Allow CPU burst for compaction + replication catch-up
+
+  jvmOptions:
+    -Xms: 12288m                     # 12GB initial heap — pre-allocate, avoids GC at startup
+    -Xmx: 16384m                     # 16GB max heap (< 24Gi pod limit — safe 8Gi buffer)
+    # -XX:MaxDirectMemorySize: caps Kafka's off-heap byte buffers (NetworkClient, fetch buffers).
+    # Without this, default MaxDirectMemorySize = -Xmx = 16GB.
+    # heap(16GB) + direct(16GB) + overhead(2GB) = 34GB > 24Gi pod limit → silent cgroup OOMKill.
+    # With cap: heap(16GB) + direct(2GB) + overhead(2GB) = 20GB < 24Gi pod limit — safe.
+    javaSystemProperties:
+      - name: jdk.tls.rejectClientInitiatedRenegotiation
+        value: "true"
+      - name: java.awt.headless
+        value: "true"
+      - name: jdk.nio.maxCachedBufferSize
+        value: "2147483648"          # 2GB NIO direct buffer cap (additional guard)
+    gcLoggingEnabled: true
+    # MaxDirectMemorySize injected via Strimzi genericJvmOptions (javaSystemProperties
+    # does not support -XX flags — use this field):
+    genericJvmOptions: "-XX:+UseG1GC -XX:MaxGCPauseMillis=100 -XX:MaxDirectMemorySize=2048m"
+
+  template:
+    pod:
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: kafka-broker
+          effect: NoSchedule
+
+      affinity:
+        podAntiAffinity:
+          # REQUIRED — not preferred. Guarantees exactly 1 broker per EC2 node.
+          # Preferred (soft) allows co-location under scheduling pressure, which
+          # breaks page cache isolation between brokers sharing the same node.
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  strimzi.io/pool-name: broker
+              topologyKey: kubernetes.io/hostname   # Hard: 1 broker per EC2 instance
+
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: role
+                    operator: In
+                    values:
+                      - kafka-broker
+
+      terminationGracePeriodSeconds: 60

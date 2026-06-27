@@ -1,0 +1,233 @@
+# =============================================================================
+# PROD NAMESPACES
+# =============================================================================
+# Namespace isolation strategy:
+#   kafka          → Strimzi operator + Kafka cluster + KafkaUser + KafkaTopic CRs
+#   kafka-connect  → Kafka Connect cluster + KafkaConnector CRs
+#   schema-registry→ Apicurio Schema Registry
+#   monitoring     → Prometheus Operator + Grafana + Alertmanager + KEDA
+#   external-secrets → External Secrets Operator
+#
+# Each namespace has resource quotas and LimitRanges to prevent runaway resource
+# consumption from a single component starving others.
+# =============================================================================
+
+# ─── Kafka Namespace ──────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kafka
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+    team: data-engineering
+  annotations:
+    # Istio sidecar injection disabled — Kafka uses its own mTLS (Strimzi-managed)
+    # Adding Istio on top would double-encrypt and add latency
+    sidecar.istio.io/inject: "false"
+
+---
+# ─── Kafka Connect Namespace ──────────────────────────────────────────────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kafka-connect
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+    team: data-engineering
+  annotations:
+    sidecar.istio.io/inject: "false"
+
+---
+# ─── Schema Registry Namespace ────────────────────────────────────────────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: schema-registry
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+    team: data-engineering
+
+---
+# ─── Monitoring Namespace ─────────────────────────────────────────────────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+    team: platform-sre
+
+---
+# ─── External Secrets Namespace ───────────────────────────────────────────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: external-secrets
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+    team: platform-sre
+
+---
+# ─── Flink Namespace ──────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: flink
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+    team: data-engineering
+
+---
+# ─── Spark Namespace ──────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: spark
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+    team: data-engineering
+
+---
+# ─── Resource Quota: Kafka Namespace ─────────────────────────────────────────
+# Calculation (right-sized resources):
+#   Standard brokers (×12 max):  6c/20Gi × 12 = 72c / 240Gi requests
+#   Tiered brokers   (×3):       6c/20Gi × 3  = 18c /  60Gi requests
+#   Controllers      (×3):       1c/ 4Gi × 3  =  3c /  12Gi requests
+#   Topic operator + headroom:                   ~10c /  20Gi
+#   Total:                                      103c / 332Gi  → quotas below
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: kafka-quota
+  namespace: kafka
+spec:
+  hard:
+    requests.cpu: "120"           # 103c calculated + ~17c headroom
+    requests.memory: "400Gi"      # 332Gi calculated + ~68Gi headroom
+    limits.cpu: "300"
+    limits.memory: "800Gi"
+    persistentvolumeclaims: "50"  # Each broker: 2 PVCs for JBOD volumes
+    pods: "30"
+
+---
+# ─── Resource Quota: Kafka Connect Namespace ─────────────────────────────────
+# 9 workers max × 2c/8Gi request = 18c/72Gi
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: kafka-connect-quota
+  namespace: kafka-connect
+spec:
+  hard:
+    requests.cpu: "30"           # 9 workers × 2c + headroom
+    requests.memory: "100Gi"     # 9 workers × 8Gi + headroom
+    limits.cpu: "60"
+    limits.memory: "120Gi"
+    pods: "20"
+
+---
+# ─── LimitRange: Flink Namespace ─────────────────────────────────────────────
+# Flink TM: request=1c/10Gi, limit=2c/14Gi (4 TMs per r5.2xlarge)
+# Flink JM: request=1c/2Gi, limit=2c/4Gi
+# Max per container raised to 14Gi to accommodate TM limit.
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: flink-limits
+  namespace: flink
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: "2"
+        memory: 14Gi
+      defaultRequest:
+        cpu: "1"
+        memory: 10Gi
+      max:
+        cpu: "4"
+        memory: 14Gi             # TM limit ceiling (14Gi = 4 TMs per r5.2xlarge by memory limit)
+
+---
+# ─── Resource Quota: Spark Namespace ─────────────────────────────────────────
+# Calculation (peak load: 3 concurrent batch jobs):
+#   Executors (×30 nodes × 3 exec/node = 90 max): 4c/16g × 90 = 360c/1440g requests
+#   Drivers   (×3 jobs):                           1c/2g  ×  3 =   3c/   6g requests
+#   Headroom:                                                      ~40c/ ~60g
+#   Total quota: 400c/1500Gi requests
+#   Note: Spark on Spot — actual node count varies. Quota is a ceiling, not a guarantee.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: spark-quota
+  namespace: spark
+spec:
+  hard:
+    requests.cpu: "400"
+    requests.memory: "1500Gi"
+    limits.cpu: "600"
+    limits.memory: "2000Gi"
+    pods: "120"               # 30 nodes × 3 executors + drivers + operator pods
+
+---
+# ─── LimitRange: Spark Namespace ─────────────────────────────────────────────
+# Executor max: 4c/18g (4c CPU + 16g heap + 2g overhead)
+# Driver max: 2c/4g (lightweight — just manages the execution plan)
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: spark-limits
+  namespace: spark
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: "4"
+        memory: 18Gi
+      defaultRequest:
+        cpu: "4"
+        memory: 16Gi
+      max:
+        cpu: "8"               # Allow large executor for shuffle-heavy jobs
+        memory: 24Gi           # 16g heap + 4g overhead + buffer
+
+---
+# ─── Airflow Namespace ────────────────────────────────────────────────────────
+# Runs Apache Airflow (scheduler + webserver + KubernetesExecutor task pods).
+# KubernetesExecutor creates ephemeral pods here for each DAG task.
+# Airflow airflow-sa has a cross-namespace RoleBinding in the spark namespace
+# so task pods can submit SparkApplication CRs.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: airflow
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+    team: data-engineering
+
+---
+# ─── Resource Quota: Airflow Namespace ───────────────────────────────────────
+# Scheduler:   500m/512Mi  | Webserver:   500m/512Mi
+# Triggerer:   200m/256Mi  | PostgreSQL:  500m/512Mi
+# KubernetesExecutor task pods: up to 10 concurrent × 1c/2Gi = 10c/20Gi
+# Total calculated: ~12c/22Gi requests → quota below includes headroom
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: airflow-quota
+  namespace: airflow
+spec:
+  hard:
+    requests.cpu: "15"
+    requests.memory: "30Gi"
+    limits.cpu: "30"
+    limits.memory: "60Gi"
+    pods: "30"

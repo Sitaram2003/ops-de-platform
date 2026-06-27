@@ -1,0 +1,443 @@
+# =============================================================================
+# JOB 1: CLICKSTREAM PROCESSOR — FlinkDeployment + Python Script
+# =============================================================================
+# What it does:
+#   Source:  Kafka topic 'app.clickstream.events'
+#            Consumer group: flink-clickstream-job (matches KEDA ScaledObject)
+#   Process: Tumbling 1-minute windows → count events per (user_id, page)
+#   Sink:    Kafka topic 'analytics.clickstream.1min' (upsert — keyed by window+user+page)
+#
+# Scaling model:
+#   parallelism: 6 → 3 TMs on r5.2xlarge (1c request × 6 = 6c ÷ 2 slots per TM = 3 TMs)
+#   Flink Autoscaler adjusts parallelism dynamically between min=2 and max=120.
+#   KEDA ScaledObject (kafka-scaledobject.yaml) signals Cluster Autoscaler to
+#   provision r5.2xlarge nodes as TM count increases.
+#
+# State backend: RocksDB (incremental checkpoints to S3 every 60s)
+#   On JobManager failure → restore from last checkpoint (< 60s data loss)
+#   On TM failure → same (exactly-once via Kafka transactions)
+#
+# Upgrade path (savepoint mode):
+#   1. Update ConfigMap with new script → ArgoCD syncs
+#   2. Update FlinkDeployment (e.g., bump image tag) → ArgoCD syncs
+#   3. Operator triggers savepoint → restarts JM+TMs → restores from savepoint
+#   Zero manual kubectl commands required.
+#
+# FUTURE — switch to Java JAR for higher throughput:
+#   1. Compile clickstream-processor.jar
+#   2. Upload to s3://de-platform-prod-flink/jars/clickstream-processor.jar
+#   3. Change spec.job.jarURI and entryClass below
+#   4. Remove the ConfigMap and volumeMount sections
+# =============================================================================
+
+# ─── Python job script (ConfigMap — mounted at /opt/flink/scripts/) ──────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickstream-processor-script
+  namespace: flink
+  labels:
+    app.kubernetes.io/name: clickstream-processor
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+data:
+  clickstream_processor.py: |
+    """
+    Clickstream Processor — Flink Table API (PyFlink)
+
+    Reads raw clickstream events from Kafka, aggregates into 1-minute tumbling
+    windows (count per user_id + page), and writes to an output Kafka topic.
+
+    Consumer group: flink-clickstream-job
+    Source topic:   app.clickstream.events
+    Sink topic:     analytics.clickstream.1min
+
+    Input schema (JSON — see Kafka topic config for Avro migration path):
+      user_id       STRING   — hashed user identifier
+      session_id    STRING   — browser session
+      page          STRING   — URL path (e.g. /product/123)
+      event_type    STRING   — click / view / scroll / purchase
+      properties    MAP      — arbitrary event metadata
+      event_ts      BIGINT   — epoch milliseconds (event time, not ingest time)
+
+    Output schema:
+      window_start  TIMESTAMP — window open time
+      window_end    TIMESTAMP — window close time (window_start + 1 min)
+      user_id       STRING
+      page          STRING
+      event_count   BIGINT    — total events in this window for this user+page
+    """
+
+    import os
+    import logging
+    from pyflink.table import EnvironmentSettings, TableEnvironment
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
+    log = logging.getLogger("clickstream-processor")
+
+
+    def get_kafka_props() -> dict:
+        """Returns Kafka connection properties from environment variables.
+        Credentials are injected by the FlinkDeployment spec (from K8s Secrets).
+        """
+        return {
+            "bootstrap.servers": os.environ["KAFKA_BOOTSTRAP_SERVERS"],
+            "security.protocol": "SASL_SSL",
+            "sasl.mechanism": "SCRAM-SHA-512",
+            "sasl.jaas.config": (
+                "org.apache.kafka.common.security.scram.ScramLoginModule required "
+                f'username="{os.environ["KAFKA_USERNAME"]}" '
+                f'password="{os.environ["KAFKA_PASSWORD"]}";'
+            ),
+            "ssl.truststore.location": "/opt/flink/certs/kafka-ca.p12",
+            "ssl.truststore.type": "PKCS12",
+            "ssl.truststore.password": "changeit",
+        }
+
+
+    def kafka_props_sql(props: dict, prefix: str = "properties.") -> str:
+        """Formats dict as SQL WITH-clause property lines."""
+        return "\n".join(
+            f"    '{prefix}{k}' = '{v}'," for k, v in props.items()
+        )
+
+
+    def main():
+        settings = EnvironmentSettings.in_streaming_mode()
+        t_env = TableEnvironment.create(settings)
+
+        # ── Flink configuration ────────────────────────────────────────────────
+        cfg = t_env.get_config()
+        cfg.set("execution.checkpointing.interval", "60s")
+        cfg.set("execution.checkpointing.mode", "EXACTLY_ONCE")
+        cfg.set("execution.checkpointing.timeout", "300s")
+        cfg.set("execution.checkpointing.min-pause", "30s")
+        cfg.set("state.backend", "rocksdb")
+        cfg.set("state.backend.incremental", "true")
+        cfg.set("state.backend.rocksdb.memory.managed", "true")
+        cfg.set(
+            "state.checkpoints.dir",
+            f"s3://{os.environ['FLINK_S3_BUCKET']}/checkpoints/clickstream",
+        )
+        cfg.set(
+            "state.savepoints.dir",
+            f"s3://{os.environ['FLINK_S3_BUCKET']}/savepoints/clickstream",
+        )
+        # Restart strategy: exponential back-off (prevents tight restart loops)
+        cfg.set("restart-strategy", "exponential-delay")
+        cfg.set("restart-strategy.exponential-delay.initial-backoff", "1s")
+        cfg.set("restart-strategy.exponential-delay.max-backoff", "5min")
+        cfg.set("restart-strategy.exponential-delay.multiplier", "2.0")
+        cfg.set("restart-strategy.exponential-delay.reset-backoff-threshold", "1h")
+
+        props = get_kafka_props()
+        bootstrap = props["bootstrap.servers"]
+        sasl_jaas = props["sasl.jaas.config"]
+
+        # ── Source table ───────────────────────────────────────────────────────
+        # JSON format for initial deployment. Migrate to Avro when schema registry
+        # is used end-to-end: change 'format' to 'avro-confluent' and add
+        # 'avro-confluent.schema-registry.url'.
+        t_env.execute_sql(f"""
+            CREATE TABLE clickstream_raw (
+                user_id       STRING,
+                session_id    STRING,
+                page          STRING,
+                event_type    STRING,
+                event_ts      BIGINT,
+                -- row_time: derived from event_ts; used for window assignment
+                row_time      AS TO_TIMESTAMP_LTZ(event_ts, 3),
+                -- Watermark: allow up to 10 seconds of late data before closing a window
+                WATERMARK FOR row_time AS row_time - INTERVAL '10' SECOND
+            ) WITH (
+                'connector'                          = 'kafka',
+                'topic'                              = 'app.clickstream.events',
+                'properties.bootstrap.servers'       = '{bootstrap}',
+                'properties.group.id'                = 'flink-clickstream-job',
+                'properties.security.protocol'       = 'SASL_SSL',
+                'properties.sasl.mechanism'          = 'SCRAM-SHA-512',
+                'properties.sasl.jaas.config'        = '{sasl_jaas}',
+                'properties.ssl.truststore.location' = '/opt/flink/certs/kafka-ca.p12',
+                'properties.ssl.truststore.type'     = 'PKCS12',
+                'properties.ssl.truststore.password' = 'changeit',
+                'scan.startup.mode'                  = 'latest-offset',
+                'format'                             = 'json',
+                'json.fail-on-missing-field'         = 'false',
+                'json.ignore-parse-errors'           = 'true'
+            )
+        """)
+
+        # ── Sink table ─────────────────────────────────────────────────────────
+        # upsert-kafka: uses (window_start, user_id, page) as composite key.
+        # Downstream consumers see the FINAL count for each key when window closes.
+        t_env.execute_sql(f"""
+            CREATE TABLE clickstream_1min (
+                window_start  TIMESTAMP(3),
+                window_end    TIMESTAMP(3),
+                user_id       STRING,
+                page          STRING,
+                event_count   BIGINT,
+                PRIMARY KEY (window_start, user_id, page) NOT ENFORCED
+            ) WITH (
+                'connector'                          = 'upsert-kafka',
+                'topic'                              = 'analytics.clickstream.1min',
+                'properties.bootstrap.servers'       = '{bootstrap}',
+                'properties.security.protocol'       = 'SASL_SSL',
+                'properties.sasl.mechanism'          = 'SCRAM-SHA-512',
+                'properties.sasl.jaas.config'        = '{sasl_jaas}',
+                'properties.ssl.truststore.location' = '/opt/flink/certs/kafka-ca.p12',
+                'properties.ssl.truststore.type'     = 'PKCS12',
+                'properties.ssl.truststore.password' = 'changeit',
+                'key.format'                         = 'json',
+                'value.format'                       = 'json'
+            )
+        """)
+
+        log.info("Tables defined. Starting window aggregation job.")
+
+        # ── Streaming query ────────────────────────────────────────────────────
+        # TUMBLE: 1-minute tumbling window on event_time (row_time column)
+        # GROUP BY window boundaries + user_id + page
+        # COUNT(*): total events per user per page per minute
+        stmt = t_env.create_statement_set()
+        stmt.add_insert_sql("""
+            INSERT INTO clickstream_1min
+            SELECT
+                window_start,
+                window_end,
+                user_id,
+                page,
+                COUNT(*)  AS event_count
+            FROM TABLE(
+                TUMBLE(TABLE clickstream_raw, DESCRIPTOR(row_time), INTERVAL '1' MINUTE)
+            )
+            GROUP BY window_start, window_end, user_id, page
+        """)
+
+        # execute().wait() blocks — keeps the Python process alive while Flink runs
+        stmt.execute().wait()
+
+
+    if __name__ == "__main__":
+        main()
+
+---
+# ─── FlinkDeployment ──────────────────────────────────────────────────────────
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: clickstream-processor
+  namespace: flink
+  labels:
+    app.kubernetes.io/name: clickstream-processor
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+spec:
+  # PLACEHOLDER: replace 123456789012 with your AWS account ID
+  image: 123456789012.dkr.ecr.ap-south-1.amazonaws.com/flink-platform:1.18.1
+  imagePullPolicy: Always
+  flinkVersion: v1_18
+  serviceAccount: flink-sa
+
+  flinkConfiguration:
+    # ── Task slots ─────────────────────────────────────────────────────────────
+    # 2 slots per TM: parallelism=6 → 3 TMs (6 slots ÷ 2 per TM)
+    # r5.2xlarge sizing: 4 TMs per node (4×14Gi=56Gi < 60Gi; 4×1c=4c < 7.72c)
+    taskmanager.numberOfTaskSlots: "2"
+
+    # ── State + checkpointing ──────────────────────────────────────────────────
+    state.backend: rocksdb
+    state.backend.incremental: "true"
+    state.backend.rocksdb.memory.managed: "true"
+    # PLACEHOLDER: replace de-platform-prod-flink with your S3 bucket name
+    state.checkpoints.dir: s3://de-platform-prod-flink/checkpoints/clickstream
+    state.savepoints.dir: s3://de-platform-prod-flink/savepoints/clickstream
+    execution.checkpointing.interval: "60000"   # 60s
+    execution.checkpointing.mode: EXACTLY_ONCE
+    execution.checkpointing.timeout: "300000"   # 5min max per checkpoint
+    execution.checkpointing.min-pause: "30000"  # 30s minimum gap between checkpoints
+    execution.checkpointing.max-concurrent-checkpoints: "1"
+
+    # ── Restart strategy ───────────────────────────────────────────────────────
+    restart-strategy: exponential-delay
+    restart-strategy.exponential-delay.initial-backoff: 1s
+    restart-strategy.exponential-delay.max-backoff: 5min
+    restart-strategy.exponential-delay.multiplier: "2.0"
+    restart-strategy.exponential-delay.reset-backoff-threshold: 1h
+
+    # ── Metrics ────────────────────────────────────────────────────────────────
+    # Prometheus pull: Prometheus PodMonitor scrapes port 9249
+    metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+    metrics.reporter.prom.port: "9249"
+
+    # ── Flink Autoscaler (FUTURE — enable after validating job behavior) ───────
+    # kubernetes.operator.autoscaler.enabled: "true"
+    # kubernetes.operator.autoscaler.metrics.window: 10m
+    # kubernetes.operator.autoscaler.target.utilization: "0.7"
+    # kubernetes.operator.autoscaler.scale-up.max-factor: "2.0"
+    # kubernetes.operator.autoscaler.scale-down.max-factor: "0.5"
+
+    # ── S3 credentials via IRSA (no static keys) ──────────────────────────────
+    s3.access-key: ""
+    s3.secret-key: ""
+    fs.s3a.aws.credentials.provider: com.amazonaws.auth.WebIdentityTokenCredentialsProvider
+
+  # ── Pod template (applies to BOTH JM and TM unless overridden below) ─────
+  podTemplate:
+    spec:
+      serviceAccountName: flink-sa
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: flink
+          effect: NoSchedule
+
+      # init container: convert Kafka cluster CA cert (PEM) → PKCS12 truststore
+      # Flink's SSL client needs PKCS12 format; Strimzi provides PEM.
+      initContainers:
+        - name: cert-converter
+          image: eclipse-temurin:11-jre-alpine
+          command:
+            - sh
+            - -c
+            - |
+              keytool -importcert -trustcacerts -noprompt \
+                -alias kafka-ca \
+                -file /certs-src/ca.crt \
+                -keystore /opt/flink/certs/kafka-ca.p12 \
+                -storetype PKCS12 \
+                -storepass changeit
+          volumeMounts:
+            - name: kafka-ca-cert
+              mountPath: /certs-src
+              readOnly: true
+            - name: flink-certs
+              mountPath: /opt/flink/certs
+
+      volumes:
+        - name: clickstream-script
+          configMap:
+            name: clickstream-processor-script
+        - name: kafka-ca-cert
+          secret:
+            secretName: de-kafka-cluster-cluster-ca-cert
+        - name: flink-certs
+          emptyDir: {}
+
+  # ── JobManager ────────────────────────────────────────────────────────────
+  jobManager:
+    resource:
+      memory: "2048m"    # JM doesn't hold state; 2GB is sufficient
+      cpu: 1
+    podTemplate:
+      spec:
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: role
+                      operator: In
+                      values:
+                        - flink
+        env:
+          - name: KAFKA_USERNAME
+            valueFrom:
+              secretKeyRef:
+                name: flink-processor   # Created by Strimzi KafkaUser CR
+                key: user
+          - name: KAFKA_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: flink-processor
+                key: password
+          - name: KAFKA_BOOTSTRAP_SERVERS
+            value: "de-kafka-cluster-kafka-tls-bootstrap.kafka.svc:9093"
+          - name: FLINK_S3_BUCKET
+            value: "de-platform-prod-flink"   # PLACEHOLDER: your S3 bucket
+          - name: ENVIRONMENT
+            value: "prod"
+        volumeMounts:
+          - name: clickstream-script
+            mountPath: /opt/flink/scripts
+          - name: flink-certs
+            mountPath: /opt/flink/certs
+
+  # ── TaskManager ───────────────────────────────────────────────────────────
+  # resource.memory: JM memory model (total process memory)
+  #   10240m = 10Gi request; Flink allocates heap + managed + network from this.
+  #   limit set via podTemplate resources (14Gi) — covers RocksDB bloom filter spikes.
+  taskManager:
+    resource:
+      memory: "10240m"   # 10Gi request — see sizing analysis in eks-cluster.yaml
+      cpu: 1             # 1c request; 4 TMs fit on r5.2xlarge (4×1c=4c < 7.72c)
+    podTemplate:
+      spec:
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: role
+                      operator: In
+                      values:
+                        - flink
+        # Override resources to add memory limit (14Gi) above request (10Gi)
+        containers:
+          - name: flink-main-container
+            resources:
+              requests:
+                memory: "10Gi"
+                cpu: "1"
+              limits:
+                memory: "14Gi"   # RocksDB off-heap can spike during state compaction
+                cpu: "2"
+        env:
+          - name: KAFKA_USERNAME
+            valueFrom:
+              secretKeyRef:
+                name: flink-processor
+                key: user
+          - name: KAFKA_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: flink-processor
+                key: password
+          - name: KAFKA_BOOTSTRAP_SERVERS
+            value: "de-kafka-cluster-kafka-tls-bootstrap.kafka.svc:9093"
+          - name: FLINK_S3_BUCKET
+            value: "de-platform-prod-flink"
+          - name: ENVIRONMENT
+            value: "prod"
+        volumeMounts:
+          - name: clickstream-script
+            mountPath: /opt/flink/scripts
+          - name: flink-certs
+            mountPath: /opt/flink/certs
+
+  # ── Job ───────────────────────────────────────────────────────────────────
+  job:
+    # PyFlink entrypoint:
+    #   jarURI: the Python driver JAR shipped with Flink in /opt/flink/opt/
+    #   entryClass: invokes Python via Py4J
+    #   args: -py <script path> (script is at /opt/flink/scripts/ via ConfigMap mount)
+    jarURI: local:///opt/flink/opt/flink-python_2.12-1.18.1.jar
+    entryClass: org.apache.flink.client.python.PythonDriver
+    args:
+      - "-py"
+      - "/opt/flink/scripts/clickstream_processor.py"
+
+    # parallelism=6: 6 parallel tasks → 3 TMs (2 slots each)
+    # Matches max partitions for effective parallelism (source has 120 partitions
+    # but 6 tasks process them in batches — scale up via autoscaler for full fan-out)
+    parallelism: 6
+
+    # savepoint: on upgrade, operator triggers savepoint → restarts → restores.
+    # Preserves window state across deployments (no dropped windows on redeploy).
+    upgradeMode: savepoint
+
+    # state: running — operator keeps this job running. Set to suspended to pause.
+    state: running

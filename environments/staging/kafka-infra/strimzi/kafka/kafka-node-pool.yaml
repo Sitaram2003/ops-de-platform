@@ -1,0 +1,128 @@
+# =============================================================================
+# STAGING KAFKA NODE POOLS — Separate controller + broker (like prod, unlike dev)
+# =============================================================================
+
+# ─── Controller Pool ──────────────────────────────────────────────────────────
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaNodePool
+metadata:
+  name: controller
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: de-kafka-cluster
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+spec:
+  replicas: 3   # Raft quorum — fixed (must be odd)
+  roles:
+    - controller
+
+  storage:
+    type: jbod
+    volumes:
+      - id: 0
+        type: persistent-claim
+        size: 20Gi
+        class: gp3-encrypted
+        deleteClaim: false
+
+  resources:
+    requests:
+      memory: 2Gi
+      cpu: "500m"
+    limits:
+      memory: 4Gi
+      cpu: "1"
+
+  jvmOptions:
+    -Xms: 1024m
+    -Xmx: 2048m
+    gcLoggingEnabled: false
+
+  template:
+    pod:
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: kafka-controller
+          effect: NoSchedule
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  strimzi.io/pool-name: controller
+              topologyKey: kubernetes.io/hostname
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: role
+                    operator: In
+                    values:
+                      - kafka-controller
+      terminationGracePeriodSeconds: 30
+
+---
+# ─── Broker Pool ──────────────────────────────────────────────────────────────
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaNodePool
+metadata:
+  name: broker
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: de-kafka-cluster
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+spec:
+  replicas: 3   # 3 brokers — 1 per AZ for HA validation
+
+  roles:
+    - broker
+
+  storage:
+    type: jbod
+    volumes:
+      - id: 0
+        type: persistent-claim
+        size: 500Gi
+        class: gp3-general
+        deleteClaim: false
+
+  resources:
+    requests:
+      memory: 8Gi
+      cpu: "2"
+    limits:
+      memory: 12Gi
+      cpu: "4"
+
+  jvmOptions:
+    -Xms: 4096m
+    -Xmx: 8192m
+    gcLoggingEnabled: false
+    genericJvmOptions: "-XX:+UseG1GC -XX:MaxGCPauseMillis=100 -XX:MaxDirectMemorySize=1024m"
+
+  template:
+    pod:
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: kafka-broker
+          effect: NoSchedule
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  strimzi.io/pool-name: broker
+              topologyKey: kubernetes.io/hostname
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: role
+                    operator: In
+                    values:
+                      - kafka-broker
+      terminationGracePeriodSeconds: 60

@@ -1,0 +1,167 @@
+# =============================================================================
+# ARGOCD APP PROJECT — DE Platform
+# =============================================================================
+# AppProject defines:
+#   1. Which Git repos ArgoCD is allowed to deploy from
+#   2. Which K8s clusters and namespaces are allowed as deploy targets
+#   3. Which K8s resource types are allowed to be created/modified
+#   4. Who can access (RBAC)
+#
+# Security model:
+#   sourceRepos: only our infra repo — not arbitrary repos
+#   destinations: specific clusters + namespaces — not kube-system
+#   clusterResourceWhitelist: only the resource types we actually use
+# =============================================================================
+
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: de-platform
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: de-platform
+  finalizers:
+    # Prevent accidental project deletion if Applications still exist
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: "Data Engineering Platform — Kafka, Flink, Spark, Redis, Snowflake"
+
+  # ─── Allowed Source Repositories ─────────────────────────────────────────
+  # PLACEHOLDER: replace with your actual Git repo URL
+  sourceRepos:
+    - "https://github.com/<ORG>/de-platform.git"
+    - "https://charts.strimzi.io"            # Strimzi Helm repo
+    - "https://strimzi.io/charts/"           # Strimzi Helm repo (alternate)
+    - "https://kedacore.github.io/charts"    # KEDA Helm repo
+    - "https://charts.external-secrets.io"  # ESO Helm repo
+    - "https://prometheus-community.github.io/helm-charts"  # kube-prometheus-stack
+    - "https://googlecloudplatform.github.io/spark-on-k8s-operator"
+    - "https://downloads.apache.org/flink/flink-kubernetes-operator-1.8.0/"
+    - "https://airflow.apache.org"
+
+  # ─── Allowed Destinations ─────────────────────────────────────────────────
+  destinations:
+    # Prod cluster namespaces
+    - server: https://kubernetes.default.svc  # In-cluster ArgoCD
+      namespace: kafka
+    - server: https://kubernetes.default.svc
+      namespace: kafka-connect
+    - server: https://kubernetes.default.svc
+      namespace: schema-registry
+    - server: https://kubernetes.default.svc
+      namespace: monitoring
+    - server: https://kubernetes.default.svc
+      namespace: external-secrets
+    - server: https://kubernetes.default.svc
+      namespace: flink
+    - server: https://kubernetes.default.svc
+      namespace: spark
+    - server: https://kubernetes.default.svc
+      namespace: airflow
+    - server: https://kubernetes.default.svc
+      namespace: argocd
+
+    # Dev cluster (separate EKS cluster) — add when de-platform-dev is registered
+    # - server: https://<DEV_CLUSTER_API_ENDPOINT>
+    #   namespace: "*"
+
+    # Staging cluster — add when de-platform-staging is registered
+    # - server: https://<STAGING_CLUSTER_API_ENDPOINT>
+    #   namespace: "*"
+
+  # ─── Allowed K8s Resource Types ──────────────────────────────────────────
+  # Namespace-scoped resources (most CRDs + K8s core types)
+  namespaceResourceWhitelist:
+    - group: ""                      # Core API group
+      kind: "ConfigMap"
+    - group: ""
+      kind: "Service"
+    - group: ""
+      kind: "ServiceAccount"
+    - group: ""
+      kind: "Secret"
+    - group: ""
+      kind: "PersistentVolumeClaim"
+    - group: ""
+      kind: "ResourceQuota"
+    - group: ""
+      kind: "LimitRange"
+    - group: "apps"
+      kind: "Deployment"
+    - group: "apps"
+      kind: "StatefulSet"
+    - group: "networking.k8s.io"
+      kind: "NetworkPolicy"
+    - group: "policy"
+      kind: "PodDisruptionBudget"
+    - group: "kafka.strimzi.io"      # All Strimzi CRDs
+      kind: "*"
+    - group: "keda.sh"               # All KEDA CRDs
+      kind: "*"
+    - group: "external-secrets.io"   # All ESO CRDs
+      kind: "*"
+    - group: "monitoring.coreos.com" # All Prometheus Operator CRDs
+      kind: "*"
+    - group: "argoproj.io"           # ArgoCD Apps (for App of Apps pattern)
+      kind: "*"
+    - group: "sparkoperator.k8s.io"  # All Spark Operator CRDs
+      kind: "*"
+    - group: "flink.apache.org"      # All Flink Operator CRDs
+      kind: "*"
+    - group: "rbac.authorization.k8s.io"
+      kind: "Role"
+    - group: "rbac.authorization.k8s.io"
+      kind: "RoleBinding"
+
+  # Cluster-scoped resources (only allow specific ones)
+  clusterResourceWhitelist:
+    - group: ""
+      kind: "Namespace"
+    - group: "storage.k8s.io"
+      kind: "StorageClass"
+    - group: "rbac.authorization.k8s.io"
+      kind: "ClusterRole"
+    - group: "rbac.authorization.k8s.io"
+      kind: "ClusterRoleBinding"
+    - group: "external-secrets.io"
+      kind: "ClusterSecretStore"
+    - group: "kafka.strimzi.io"
+      kind: "Kafka"
+    - group: "kafka.strimzi.io"
+      kind: "KafkaNodePool"
+
+  # ─── RBAC ────────────────────────────────────────────────────────────────
+  roles:
+    # Data Engineering Team Leads: full control
+    - name: de-team-leads
+      description: "DE Team Leads — can sync prod and dev"
+      policies:
+        - p, proj:de-platform:de-team-leads, applications, *, de-platform/*, allow
+      groups:
+        - data-engineering-leads
+
+    # Data Engineers: can sync dev only, read prod
+    - name: de-engineers
+      description: "DE Engineers — sync dev, read prod"
+      policies:
+        - p, proj:de-platform:de-engineers, applications, sync, de-platform/dev-*, allow
+        - p, proj:de-platform:de-engineers, applications, get, de-platform/*, allow
+      groups:
+        - data-engineering
+
+  # ─── Sync Windows ─────────────────────────────────────────────────────────
+  # Prevent any production syncs during business-critical hours (flash sale windows)
+  # Override possible for on-call emergency fixes
+  syncWindows:
+    - kind: deny
+      schedule: "0 18 * * 5"        # Block prod syncs every Friday 6pm (pre-weekend freeze)
+      duration: 48h
+      applications:
+        - "prod-kafka-*"
+        - "prod-spark-*"
+        - "prod-flink-*"
+      namespaces:
+        - kafka
+        - spark
+        - flink
+      manualSync: false              # Even manual syncs blocked (override via ArgoCD UI)

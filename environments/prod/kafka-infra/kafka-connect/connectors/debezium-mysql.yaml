@@ -1,0 +1,92 @@
+# =============================================================================
+# PROD DEBEZIUM MYSQL CDC CONNECTOR
+# =============================================================================
+# Reads MySQL/Aurora binlog → produces CDC events to Kafka.
+#
+# MySQL binlog vs PostgreSQL WAL:
+#   PostgreSQL: WAL = append-only binary log. Logical replication slot = cursor.
+#   MySQL: binlog = binary log with events. Debezium uses server.id to pose as a replica.
+#   MySQL: supports multiple sources → tasksMax > 1 is theoretically possible,
+#          but single task per connector is simpler and avoids ordering complexity.
+#
+# MySQL prerequisites (run once on Aurora/RDS before first deploy):
+#   -- Enable binary logging: binlog_format=ROW in RDS parameter group (default on Aurora)
+#   CREATE USER 'debezium_user'@'%' IDENTIFIED BY '<password>';
+#   GRANT SELECT, RELOAD, SHOW DATABASES, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO debezium_user;
+#   FLUSH PRIVILEGES;
+# =============================================================================
+
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaConnector
+metadata:
+  name: debezium-mysql-orders
+  namespace: kafka-connect
+  labels:
+    strimzi.io/cluster: de-connect-cluster
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+spec:
+  class: io.debezium.connector.mysql.MySqlConnector
+  tasksMax: 1                        # Single task — MySQL binlog is a single ordered stream
+
+  config:
+    # ─── Database Connection (injected from ESO secrets) ──────────────────
+    database.hostname: "${env:MYSQL_DB_HOSTNAME}"
+    database.port: "${env:MYSQL_DB_PORT}"
+    database.user: "${env:MYSQL_DB_USERNAME}"
+    database.password: "${env:MYSQL_DB_PASSWORD}"
+    database.server.name: "mysql-orders-db"   # Topic prefix
+
+    # server.id: unique ID that Debezium uses when connecting to MySQL as a replica
+    # MUST be unique across all MySQL replicas (including other Debezium instances)
+    # Format: any unused integer. Check: SHOW SLAVE HOSTS; on MySQL primary.
+    database.server.id: "184054"
+
+    # ─── Snapshot ─────────────────────────────────────────────────────────
+    # when_needed: snapshot if Debezium's binlog position is no longer available
+    # This handles the case where MySQL binary log retention expired while Debezium was down
+    # The connector auto-detects invalid binlog position → takes a fresh snapshot automatically
+    snapshot.mode: when_needed
+
+    # ─── Database & Table Filtering ───────────────────────────────────────
+    database.include.list: "orders_db,inventory_db"
+    table.include.list: "orders_db.orders,orders_db.order_items,inventory_db.products"
+
+    # ─── Topic Routing ────────────────────────────────────────────────────
+    topic.prefix: "cdc"
+
+    # ─── Single Message Transforms ────────────────────────────────────────
+    transforms: "unwrap,routeByTable,filterHeartbeat"
+
+    transforms.unwrap.type: io.debezium.transforms.ExtractNewRecordState
+    transforms.unwrap.drop.tombstones: "false"
+    transforms.unwrap.delete.handling.mode: rewrite
+    transforms.unwrap.add.fields: "op,ts_ms,db,table"
+
+    # Route events to table-specific topics (for Flink to consume per-table)
+    # Orders → cdc.orders, Products → cdc.products
+    transforms.routeByTable.type: io.debezium.transforms.ByLogicalTableRouter
+    transforms.routeByTable.topic.regex: "cdc.mysql-orders-db.(.*)"
+    transforms.routeByTable.topic.replacement: "cdc.$1"  # cdc.orders, cdc.order_items, cdc.products
+
+    transforms.filterHeartbeat.type: io.debezium.transforms.Filter
+    transforms.filterHeartbeat.condition: "value.op != 'h'"
+
+    # ─── Error Handling ───────────────────────────────────────────────────
+    errors.tolerance: all
+    errors.deadletterqueue.topic.name: dlq.cdc.mysql-orders-db
+    errors.deadletterqueue.context.headers.enable: "true"
+    errors.deadletterqueue.topic.replication.factor: "3"
+
+    exactly.once.support: required
+    transaction.boundary: transaction
+
+    # ─── Heartbeat ────────────────────────────────────────────────────────
+    heartbeat.interval.ms: 30000
+    heartbeat.topics.prefix: "__debezium-heartbeat"
+
+    # ─── Binary Log Retention Safety ──────────────────────────────────────
+    # If Debezium restarts and the binlog position is > expire_logs_days old:
+    # snapshot.mode: when_needed handles this automatically by re-snapshotting.
+    # Additionally: set expire_logs_days=7 or binlog_expire_logs_seconds=604800 on RDS
+    # to retain 7 days of binlog (gives Debezium room to recover from downtime).

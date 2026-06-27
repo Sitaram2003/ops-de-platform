@@ -1,0 +1,147 @@
+# =============================================================================
+# AIRFLOW HELM VALUES — Dev
+# =============================================================================
+# Consumed by the ArgoCD multi-source Application in operator/airflow-app.yaml
+# via $values/environments/dev/airflow/helm-values.yaml.
+#
+# Differences from prod:
+#   - Resources halved (scheduler, webserver, triggerer, postgresql)
+#   - PostgreSQL persistence disabled (emptyDir — faster pod restarts in dev)
+#   - git-sync branch: main (same as staging/prod — trunk-based, envs differ by image tags)
+#   - Remote logging disabled (keep logs local in dev)
+# =============================================================================
+
+executor: KubernetesExecutor
+
+# ── Airflow config overrides ──────────────────────────────────────────────────
+config:
+  core:
+    dags_are_paused_at_creation: "true"
+    load_examples: "false"
+    dags_folder: /opt/airflow/dags/repo/HEAD/dags
+  kubernetes_executor:
+    namespace: airflow
+    worker_service_account_name: airflow-sa
+
+# ── DAGs via git-sync ─────────────────────────────────────────────────────────
+dags:
+  persistence:
+    enabled: false
+  gitSync:
+    enabled: true
+    repo: git@github.com:Sitaramu2003/ops-de-jobs.git   # DAGs live in de-jobs, not de-platform
+    branch: main   # trunk-based: all envs pull DAGs from main; diff is image tags, not branches
+    rev: HEAD
+    depth: 1
+    subPath: airflow   # exposes de-jobs/airflow/ → repo/HEAD/; dags_folder = repo/HEAD/dags
+    sshKeySecret: git-credentials
+    period: 60s
+    containerName: git-sync
+
+# ── Scheduler ─────────────────────────────────────────────────────────────────
+scheduler:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# ── Webserver ─────────────────────────────────────────────────────────────────
+webserver:
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  service:
+    type: ClusterIP
+  defaultUser:
+    enabled: true
+    role: Admin
+    username: admin
+    email: ops.dataeng@gmail.com
+    firstName: Airflow
+    lastName: Admin
+    password: ~
+
+# ── Triggerer ─────────────────────────────────────────────────────────────────
+triggerer:
+  enabled: true
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+
+# ── Security ──────────────────────────────────────────────────────────────────
+fernetKeySecretName: airflow-fernet-key
+webserverSecretKeySecretName: airflow-webserver-secret
+
+# ── PostgreSQL — emptyDir in dev (data lost on pod restart, intentional) ──────
+postgresql:
+  enabled: true
+  image:
+    registry: docker.io
+    repository: bitnami/postgresql
+    tag: 16.1
+  auth:
+    existingSecret: airflow-postgres-secret
+    secretKeys:
+      adminPasswordKey: postgresql-password
+  primary:
+    persistence:
+      enabled: false
+    resources:
+      requests:
+        cpu: 250m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+# ── Service account ───────────────────────────────────────────────────────────
+serviceAccount:
+  create: false
+  name: airflow-sa
+
+# ── Node placement: operators-ng ──────────────────────────────────────────────
+tolerations:
+  - key: dedicated
+    operator: Equal
+    value: operators
+    effect: NoSchedule
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: role
+              operator: In
+              values:
+                - operators
+
+# ── Airflow Variables (injected as environment variables) ─────────────────────
+env:
+  - name: AIRFLOW_VAR_SPARK_DQ_REPORT_IMAGE
+    value: "PLACEHOLDER_ECR/spark-dq-report:latest"
+  - name: AIRFLOW_VAR_SPARK_CLICKSTREAM_AGG_IMAGE
+    value: "PLACEHOLDER_ECR/spark-clickstream-agg:latest"
+  - name: AIRFLOW_VAR_SPARK_TRANSACTION_ANALYTICS_IMAGE
+    value: "PLACEHOLDER_ECR/spark-transaction-analytics:latest"
+  - name: AIRFLOW_VAR_S3_DATA_LAKE_BUCKET
+    value: "de-data-lake-dev"
+  - name: AIRFLOW_VAR_SNOWFLAKE_WAREHOUSE
+    value: "DEV_WAREHOUSE"
+  - name: AIRFLOW_VAR_SPARK_EXECUTOR_INSTANCES
+    value: "1"
+  - name: AIRFLOW_VAR_SPARK_EXECUTOR_MEMORY
+    value: "4g"
+  - name: AIRFLOW_VAR_SPARK_EXECUTOR_CORES
+    value: "1"

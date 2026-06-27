@@ -1,0 +1,64 @@
+# kube-prometheus-stack Helm values — Prod
+# 90d retention, 100Gi storage, PagerDuty for critical + Slack for warning.
+# Grafana with persistent storage.
+
+prometheus:
+  prometheusSpec:
+    retention: 90d
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp3-general
+          resources:
+            requests:
+              storage: 100Gi
+
+alertmanager:
+  config:
+    global:
+      slack_api_url: "https://hooks.slack.com/services/PLACEHOLDER"
+      pagerduty_url: "https://events.pagerduty.com/v2/enqueue"
+    route:
+      group_by: [alertname, namespace, team]
+      receiver: slack-prod-warning
+      routes:
+        - matchers:
+            - severity = critical
+          receiver: pagerduty-prod
+          continue: true
+        - matchers:
+            - severity = critical
+          receiver: slack-prod-critical
+        - matchers:
+            - severity = warning
+          receiver: slack-prod-warning
+    receivers:
+      - name: slack-prod-warning
+        slack_configs:
+          - channel: "#de-alerts-prod"
+            send_resolved: true
+            title: "[{{ .Status | toUpper }}{{ if eq .Status \"firing\" }}:{{ .Alerts.Firing | len }}{{ end }}] {{ .CommonLabels.alertname }}"
+      - name: slack-prod-critical
+        slack_configs:
+          - channel: "#de-incidents-prod"
+            send_resolved: true
+            title: "[CRITICAL]{{ if eq .Status \"firing\" }}:{{ .Alerts.Firing | len }}{{ end }}] {{ .CommonLabels.alertname }}"
+      - name: pagerduty-prod
+        pagerduty_configs:
+          - routing_key: "PLACEHOLDER_PAGERDUTY_PROD_KEY"   # Set via ESO / Secrets Manager
+            description: "{{ .CommonAnnotations.summary }}"
+            severity: "{{ .CommonLabels.severity }}"
+            details:
+              team: "{{ .CommonLabels.team }}"
+              namespace: "{{ .CommonLabels.namespace }}"
+
+grafana:
+  adminPassword: ""   # Set via grafana-admin-secret (ESO-managed)
+  persistence:
+    enabled: true
+    storageClassName: gp3-general
+    size: 10Gi
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard

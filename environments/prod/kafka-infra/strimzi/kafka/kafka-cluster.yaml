@@ -1,0 +1,265 @@
+# =============================================================================
+# PROD KAFKA CLUSTER CR — Strimzi KRaft Mode
+# =============================================================================
+# This is the central "brain" of the cluster. Strimzi Operator watches this CR
+# and reconciles the actual cluster state toward what's declared here.
+#
+# Key design choices:
+#   • KRaft (no ZooKeeper) — Kafka 3.3+ native, simpler operations, faster failover
+#   • Tiered Storage — S3 for cold segments, local EBS for hot (Netflix pattern)
+#   • Rack awareness — partition replicas spread across AZs (ap-south-1a/b/c)
+#   • Cruise Control — auto-rebalances partitions when brokers are added/removed
+#   • SASL/SCRAM-SHA-512 — per-user authentication with ACL-based authorization
+#
+# Listeners:
+#   tls (9093)      → in-cluster traffic (Flink, Spark, Kafka Connect, Schema Registry)
+#   external (9094) → cross-VPC or external services (NLB per broker)
+# =============================================================================
+
+apiVersion: kafka.strimzi.io/v1beta2
+kind: Kafka
+metadata:
+  name: de-kafka-cluster
+  namespace: kafka
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+  annotations:
+    strimzi.io/node-pools: enabled   # Enables KafkaNodePool CRs for this cluster
+    strimzi.io/kraft: enabled        # KRaft mode — no ZooKeeper dependency
+
+spec:
+  kafka:
+    version: 3.7.0                   # Pin version — controlled upgrades via rolling restart
+    metadataVersion: 3.7-IV4         # KRaft metadata format. Must be ≤ Kafka version.
+                                     # Controls which KRaft features are enabled.
+                                     # Increment during Kafka version upgrades only.
+
+    listeners:
+      # ─── Internal TLS Listener ────────────────────────────────────────────
+      # Used by: Flink, Spark, Kafka Connect, Schema Registry (all in-cluster)
+      # Strimzi creates a ClusterIP Service: de-kafka-cluster-kafka-tls-bootstrap.kafka:9093
+      # TLS: Strimzi auto-generates cluster CA cert, rotates annually.
+      # SASL/SCRAM: each client authenticates with its own KafkaUser credentials.
+      - name: tls
+        port: 9093
+        type: internal               # ClusterIP — not reachable outside K8s
+        tls: true
+        authentication:
+          type: scram-sha-512
+          # SCRAM flow:
+          #   client → SCRAM ClientFirst → broker verifies against stored iteration
+          #   Password never transmitted in cleartext (challenge-response protocol)
+        networkPolicyPeers:
+          # Only allow pods in these namespaces to reach this listener
+          # Defense-in-depth: even if a namespace is compromised, Kafka is not
+          - namespaceSelector:
+              matchExpressions:
+                - key: kubernetes.io/metadata.name
+                  operator: In
+                  values:
+                    - kafka
+                    - kafka-connect
+                    - schema-registry
+                    - flink
+                    - spark
+                    - monitoring
+
+      # ─── External Listener (NLB) ───────────────────────────────────────────
+      # Used by: services outside K8s cluster (external producers, BI tools)
+      # Creates one NLB per broker + one bootstrap NLB.
+      # internal scheme = NLB accessible within VPC only (not public internet)
+      - name: external
+        port: 9094
+        type: loadbalancer
+        tls: true
+        authentication:
+          type: scram-sha-512
+        configuration:
+          bootstrap:
+            annotations:
+              service.beta.kubernetes.io/aws-load-balancer-type: nlb
+              service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+              service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+          brokers:
+            - broker: 0
+              annotations:
+                service.beta.kubernetes.io/aws-load-balancer-type: nlb
+                service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+            - broker: 1
+              annotations:
+                service.beta.kubernetes.io/aws-load-balancer-type: nlb
+                service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+            - broker: 2
+              annotations:
+                service.beta.kubernetes.io/aws-load-balancer-type: nlb
+                service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+
+    authorization:
+      type: simple                   # Kafka's built-in ACL mechanism
+      superUsers:
+        - User:kafka-admin           # Operator admin (break-glass only)
+        - User:strimzi-kafka-user    # Strimzi internal user
+
+    config:
+      # ─── Replication & Durability ──────────────────────────────────────
+      # These three settings together guarantee zero message loss:
+      #   acks=-1 (producer): wait for ALL ISR replicas to acknowledge
+      #   min.insync.replicas=2: at least 2 replicas must be in-sync
+      #   replication.factor=3: 3 copies — survive 2 simultaneous broker failures
+      offsets.topic.replication.factor: 3       # Consumer offset storage
+      transaction.state.log.replication.factor: 3  # Exactly-once transaction log
+      transaction.state.log.min.isr: 2          # Transaction commits need 2 ISR acks
+      default.replication.factor: 3             # Default for new topics
+      min.insync.replicas: 2                    # Global min — per-topic can override
+
+      # ─── Network Throughput ────────────────────────────────────────────
+      # socket buffers: 100KB (matches typical Kafka batch size for high-throughput)
+      # request.max.bytes: 100MB — allows large batch uploads from Spark
+      socket.send.buffer.bytes: 102400
+      socket.receive.buffer.bytes: 102400
+      socket.request.max.bytes: 104857600
+
+      # ─── Log / Retention ──────────────────────────────────────────────
+      log.retention.hours: 168                  # 7 days default (per-topic can override)
+      log.segment.bytes: 1073741824             # 1GB segments — good balance of file count vs size
+      log.retention.check.interval.ms: 300000  # Check every 5min for expired segments
+
+      # ─── Thread Tuning ─────────────────────────────────────────────────
+      # r5.4xlarge has 16 vCPUs. Rule: io.threads = 2× data disks per broker.
+      # With 2 EBS volumes per broker pod: num.io.threads = 16.
+      # num.network.threads: handles network I/O (accepting connections, reading requests)
+      num.io.threads: 16
+      num.network.threads: 8
+      num.replica.fetchers: 4        # Parallel replication threads (higher = faster catch-up)
+
+      # ─── Compression ──────────────────────────────────────────────────
+      # lz4: fastest CPU-efficient compression (Netflix/Uber standard for hot path)
+      # End-to-end compression: producer compresses → stored compressed → consumer decompresses
+      compression.type: lz4
+
+      # ─── Tiered Storage (Kafka Native — 3.6+) ─────────────────────────
+      # Cold segments automatically uploaded to S3 after local.retention.ms.
+      # Flink can replay old data from S3 (slower but no broker disk needed).
+      # HOT: last 6 hours on EBS (fast, low latency for active consumers)
+      # COLD: 7+ days on S3 (cheap, for replay/backfill jobs)
+      remote.log.storage.system.enable: "true"
+      remote.log.manager.class.name: org.apache.kafka.server.log.remote.storage.RemoteLogManagerConfig
+      remote.log.storage.manager.class.name: io.strimzi.kafka.tieredstorage.s3.S3RemoteStorageManager
+      remote.log.storage.manager.class.path: /opt/kafka/libs/tiered-storage/*
+      remote.log.storage.manager.impl.prefix: s3.
+      # PLACEHOLDER: update bucket name from config/placeholders.yaml → s3.tiered_storage_prod
+      s3.bucket.name: "de-kafka-tiered-storage-prod"
+      s3.region: ap-south-1
+      # local.retention.ms: keep 6 hours on broker AFTER upload to S3
+      # Consumer reads last 6 hours from broker (fast) — older from S3 (slower)
+      remote.log.manager.local.retention.ms: "21600000"   # 6 hours
+
+      # ─── Rack Awareness ────────────────────────────────────────────────
+      # Strimzi injects ${STRIMZI_RACK_ID} = node's topology.kubernetes.io/zone value
+      # (e.g., ap-south-1a, ap-south-1b, ap-south-1c)
+      # Kafka uses this to spread partition replicas across AZs.
+      # If ap-south-1a goes down, replicas in 1b and 1c keep serving traffic.
+      broker.rack: "${STRIMZI_RACK_ID}"
+
+      # ─── Consumer / Producer Defaults ─────────────────────────────────
+      auto.create.topics.enable: "false"   # Explicit topic creation only (managed by KafkaTopic CRs)
+      delete.topic.enable: "true"          # Allow topic deletion (managed lifecycle)
+      group.initial.rebalance.delay.ms: 3000  # Wait 3s before first rebalance (reduces churn on startup)
+
+      # ─── Quota (prevent one producer from saturating a broker) ────────
+      # Per-producer/consumer quota enforced by brokers:
+      # 500MB/s produce quota per client → 6 Gbps total across 12 clients
+      client.quota.callback.class: org.apache.kafka.server.quota.ClientQuotaCallback
+      quota.producer.default: 536870912    # 512MB/s per producer
+      quota.consumer.default: 536870912    # 512MB/s per consumer
+
+    rack:
+      topologyKey: topology.kubernetes.io/zone   # AZ-based rack awareness
+
+    # JMX Prometheus Exporter — exposes broker metrics at /metrics endpoint
+    # Prometheus scrapes this via PodMonitor (monitoring/prometheus/kafka-pod-monitor.yaml)
+    metricsConfig:
+      type: jmxPrometheusExporter
+      valueFrom:
+        configMapKeyRef:
+          name: kafka-jmx-exporter-config
+          key: kafka-metrics-config.yml
+
+    readinessProbe:
+      initialDelaySeconds: 30        # Kafka brokers take 20-30s to load partition leaders
+      timeoutSeconds: 5
+      failureThreshold: 3
+      periodSeconds: 10
+
+    livenessProbe:
+      initialDelaySeconds: 60        # Give brokers full 60s to initialize before checking
+      timeoutSeconds: 5
+      failureThreshold: 3
+      periodSeconds: 10
+
+  entityOperator:
+    # topicOperator: watches KafkaTopic CRs and applies them to the cluster
+    # Without topicOperator: must manage topics manually (kafka-topics.sh)
+    topicOperator:
+      resources:
+        requests:
+          memory: 512Mi
+          cpu: "0.2"
+        limits:
+          memory: 1Gi
+          cpu: "0.5"
+      reconciliationIntervalSeconds: 90    # Sync every 90s (more responsive than default 120s)
+      topicMetadataMaxAttempts: 6
+
+    # userOperator: watches KafkaUser CRs and creates SCRAM credentials + K8s Secrets
+    # Without userOperator: must create users manually (kafka-configs.sh + secret creation)
+    userOperator:
+      resources:
+        requests:
+          memory: 512Mi
+          cpu: "0.2"
+        limits:
+          memory: 1Gi
+          cpu: "0.5"
+      reconciliationIntervalSeconds: 90
+
+  # Cruise Control: auto-rebalances partitions when brokers are added (scale-up)
+  # Without this: new broker stays empty → hot existing brokers → performance cliff
+  # With this: Cruise Control detects imbalance → moves partitions → even distribution
+  cruiseControl:
+    resources:
+      requests:
+        memory: 2Gi
+        cpu: "0.5"
+      limits:
+        memory: 4Gi
+        cpu: "2"
+    config:
+      # Goals (in priority order) — Cruise Control optimizes these in sequence:
+      #   1. RackAwareGoal: replicas MUST be in different AZs (non-negotiable)
+      #   2. ReplicaCapacityGoal: no broker should hold more replicas than capacity
+      #   3. DiskCapacityGoal: broker disk usage < 80%
+      #   4. NetworkInboundCapacityGoal / NetworkOutboundCapacityGoal
+      #   5. LeaderReplicaDistributionGoal: spread partition leaders evenly
+      #   6. TopicReplicaDistributionGoal: spread topic replicas evenly
+      default.goals: >
+        com.linkedin.kafka.cruisecontrol.analyzer.goals.RackAwareGoal,
+        com.linkedin.kafka.cruisecontrol.analyzer.goals.ReplicaCapacityGoal,
+        com.linkedin.kafka.cruisecontrol.analyzer.goals.DiskCapacityGoal,
+        com.linkedin.kafka.cruisecontrol.analyzer.goals.NetworkInboundCapacityGoal,
+        com.linkedin.kafka.cruisecontrol.analyzer.goals.NetworkOutboundCapacityGoal,
+        com.linkedin.kafka.cruisecontrol.analyzer.goals.LeaderReplicaDistributionGoal,
+        com.linkedin.kafka.cruisecontrol.analyzer.goals.TopicReplicaDistributionGoal
+      # Auto-rebalance when a broker is added (scale-up event)
+      # Without this: you'd have to manually trigger rebalance via REST API
+      auto.rebalance.enabled: "true"
+      # Throttle rebalance to not exceed 50MB/s per broker (avoid impacting producers)
+      default.replication.throttle: 52428800   # 50MB/s
+    template:
+      pod:
+        tolerations:
+          - key: dedicated
+            operator: Equal
+            value: operators
+            effect: NoSchedule

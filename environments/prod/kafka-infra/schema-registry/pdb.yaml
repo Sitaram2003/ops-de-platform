@@ -1,0 +1,34 @@
+# =============================================================================
+# POD DISRUPTION BUDGET — Apicurio Schema Registry (Prod)
+# =============================================================================
+# Schema Registry runs as 3 replicas (stateless — all read/write from the
+# backing Kafka topics). During a node drain, losing all 3 replicas
+# simultaneously would cause:
+#   - Kafka producers: schema registration fails → producing blocks or fails
+#   - Kafka consumers: schema fetch fails → deserialization errors
+#   - Flink jobs: KafkaAvroDeserializer can't fetch schema → job restart
+#
+# minAvailable: 1 ensures at least one replica remains available during
+# drain. The K8s scheduler will not evict a pod if it would violate this
+# budget — the drain stalls until the replacement pod is ready on another node.
+#
+# Selector: matches the Deployment's pod selector label `app: apicurio-registry`
+# (set in environments/prod/kafka-infra/schema-registry/apicurio-registry.yaml)
+# =============================================================================
+
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: schema-registry-pdb
+  namespace: schema-registry
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+  annotations:
+    argocd.argoproj.io/sync-wave: "+5"
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: apicurio-registry    # Matches Deployment pod selector
+</content>

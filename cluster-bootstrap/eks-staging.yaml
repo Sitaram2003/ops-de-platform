@@ -1,0 +1,171 @@
+# =============================================================================
+# STAGING EKS CLUSTER — eksctl ClusterConfig
+# =============================================================================
+# Deploy:  eksctl create cluster -f cluster-bootstrap/eks-staging.yaml
+#
+# Staging is between dev and prod:
+#   • m5.xlarge general nodes (vs t3.medium in dev, m5.large in prod)
+#   • r5.xlarge Kafka brokers (vs r5.xlarge dev, r5.4xlarge prod)
+#   • 3 Kafka brokers (vs 1 in dev, 3-12 in prod)
+#   • Network policies + PDBs present (same as prod)
+#   • Manual sync only (no auto-sync)
+#   • Uses 'main' branch
+# =============================================================================
+
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: de-platform-staging
+  region: ap-south-1
+  version: "1.31"
+
+iam:
+  withOIDC: true
+
+addons:
+  - name: aws-ebs-csi-driver
+    version: latest
+    attachPolicyARNs:
+      - arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy
+  - name: vpc-cni
+    version: latest
+  - name: coredns
+    version: latest
+  - name: kube-proxy
+    version: latest
+
+managedNodeGroups:
+
+  # ── 1. OPERATORS NODE GROUP ───────────────────────────────────────────────
+  - name: operators-ng
+    instanceType: m5.xlarge
+    minSize: 2
+    maxSize: 2
+    availabilityZones:
+      - ap-south-1a
+      - ap-south-1b
+    labels:
+      role: operators
+      environment: staging
+    taints:
+      - key: dedicated
+        value: operators
+        effect: NoSchedule
+
+  # ── 2. MONITORING NODE GROUP ──────────────────────────────────────────────
+  - name: monitoring-ng
+    instanceType: m5.xlarge
+    minSize: 1
+    maxSize: 2
+    availabilityZones:
+      - ap-south-1a
+      - ap-south-1b
+    labels:
+      role: monitoring
+      environment: staging
+    taints:
+      - key: dedicated
+        value: monitoring
+        effect: NoSchedule
+
+  # ── 3. KAFKA BROKER NODE GROUP ────────────────────────────────────────────
+  # r5.xlarge: 4 vCPU, 32GB — 3 brokers for staging HA testing
+  - name: kafka-brokers-ng
+    instanceType: r5.xlarge
+    minSize: 3
+    maxSize: 6
+    availabilityZones:
+      - ap-south-1a
+      - ap-south-1b
+      - ap-south-1c
+    labels:
+      role: kafka-broker
+      environment: staging
+    taints:
+      - key: dedicated
+        value: kafka-broker
+        effect: NoSchedule
+    iam:
+      withAddonPolicies:
+        autoScaler: true
+
+  # ── 4. KAFKA CONTROLLER NODE GROUP ───────────────────────────────────────
+  - name: kafka-controllers-ng
+    instanceType: m5.large
+    minSize: 3
+    maxSize: 3                    # FIXED — Raft quorum
+    availabilityZones:
+      - ap-south-1a
+      - ap-south-1b
+      - ap-south-1c
+    labels:
+      role: kafka-controller
+      environment: staging
+    taints:
+      - key: dedicated
+        value: kafka-controller
+        effect: NoSchedule
+
+  # ── 5. FLINK NODE GROUP ───────────────────────────────────────────────────
+  - name: flink-ng
+    instanceType: r5.xlarge
+    minSize: 2
+    maxSize: 20
+    availabilityZones:
+      - ap-south-1a
+      - ap-south-1b
+      - ap-south-1c
+    labels:
+      role: flink
+      environment: staging
+    taints:
+      - key: dedicated
+        value: flink
+        effect: NoSchedule
+    iam:
+      withAddonPolicies:
+        autoScaler: true
+
+  # ── 6. SPARK NODE GROUP ───────────────────────────────────────────────────
+  - name: spark-ng
+    instanceTypes:
+      - m5.2xlarge
+      - m5a.2xlarge
+      - m4.2xlarge
+    spot: true
+    minSize: 0
+    maxSize: 10
+    availabilityZones:
+      - ap-south-1a
+      - ap-south-1b
+      - ap-south-1c
+    labels:
+      role: spark
+      environment: staging
+    taints:
+      - key: dedicated
+        value: spark
+        effect: NoSchedule
+    iam:
+      withAddonPolicies:
+        autoScaler: true
+
+  # ── 7. KAFKA CONNECT NODE GROUP ───────────────────────────────────────────
+  - name: kafka-connect-ng
+    instanceType: c5.xlarge
+    minSize: 2
+    maxSize: 6
+    availabilityZones:
+      - ap-south-1a
+      - ap-south-1b
+    labels:
+      role: kafka-connect
+      environment: staging
+    taints:
+      - key: dedicated
+        value: kafka-connect
+        effect: NoSchedule
+    iam:
+      withAddonPolicies:
+        autoScaler: true

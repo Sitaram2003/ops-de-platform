@@ -1,0 +1,90 @@
+# =============================================================================
+# KEDA SCALED OBJECTS — Staging
+# =============================================================================
+# Intermediate min/max replica counts between dev and prod.
+# =============================================================================
+
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: flink-tm-clickstream-scaler
+  namespace: flink
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+spec:
+  scaleTargetRef:
+    apiVersion: flink.apache.org/v1beta1
+    kind: FlinkDeployment
+    name: clickstream-processor
+  pollingInterval: 15
+  cooldownPeriod: 300
+  minReplicaCount: 2
+  maxReplicaCount: 30    # Between dev (10) and prod (120)
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: de-kafka-cluster-kafka-tls-bootstrap.kafka.svc:9093
+        consumerGroup: flink-clickstream-job
+        topic: app.clickstream.events
+        lagThreshold: "1000"
+        activationLagThreshold: "10"
+        offsetResetPolicy: latest
+        allowIdleConsumers: "false"
+        scaleToZeroOnInvalidOffset: "false"
+      authenticationRef:
+        name: kafka-trigger-auth-flink
+
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: flink-tm-cdc-scaler
+  namespace: flink
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+spec:
+  scaleTargetRef:
+    apiVersion: flink.apache.org/v1beta1
+    kind: FlinkDeployment
+    name: cdc-enrichment
+  pollingInterval: 15
+  cooldownPeriod: 300
+  minReplicaCount: 1
+  maxReplicaCount: 15    # Between dev (5) and prod (60)
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: de-kafka-cluster-kafka-tls-bootstrap.kafka.svc:9093
+        consumerGroup: flink-cdc-enrichment-job
+        topic: cdc.postgres-app-db
+        lagThreshold: "500"
+        activationLagThreshold: "5"
+        offsetResetPolicy: earliest
+      authenticationRef:
+        name: kafka-trigger-auth-flink
+
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: kafka-trigger-auth-flink
+  namespace: flink
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+spec:
+  secretTargetRef:
+    - parameter: username
+      name: flink-processor
+      key: user
+    - parameter: password
+      name: flink-processor
+      key: password
+    - parameter: tls
+      name: flink-processor
+      key: tls
+    - parameter: ca
+      name: de-kafka-cluster-cluster-ca-cert
+      key: ca.crt

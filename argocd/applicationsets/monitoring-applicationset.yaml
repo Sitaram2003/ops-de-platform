@@ -1,0 +1,113 @@
+# =============================================================================
+# ARGOCD APPLICATION SET — Monitoring Stack (Prod + Dev + Staging)
+# =============================================================================
+# Watches environments/prod/monitoring/, environments/staging/monitoring/,
+# and environments/dev/monitoring/.
+#
+# NOTE ON CRD BOOTSTRAPPING:
+#   Prometheus Operator CRDs (PodMonitor, PrometheusRule, etc.) are installed by
+#   kube-prometheus-stack. If Flink/Spark ApplicationSets try to apply PodMonitor
+#   CRs before kube-prometheus-stack finishes, ArgoCD will fail and auto-retry.
+#   Deployment order: apply this ApplicationSet FIRST.
+#
+# Deploy:
+#   kubectl apply -f argocd/applicationsets/monitoring-applicationset.yaml -n argocd
+# =============================================================================
+
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: monitoring-platform
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    component: monitoring
+spec:
+  generators:
+    - list:
+        elements:
+          - env: prod
+            cluster: https://kubernetes.default.svc
+            branch: main
+            path: environments/prod/monitoring
+            auto_sync: "false"   # Prod monitoring changes: always manual
+            prune: "false"       # Never auto-delete Prometheus / Grafana
+            self_heal: "false"
+
+          - env: staging
+            cluster: https://kubernetes.default.svc    # PLACEHOLDER: staging cluster endpoint
+            branch: main
+            path: environments/staging/monitoring
+            auto_sync: "false"   # Manual sync for staging
+            prune: "false"
+            self_heal: "false"
+
+          - env: dev
+            cluster: https://kubernetes.default.svc
+            branch: develop
+            path: environments/dev/monitoring
+            auto_sync: "true"
+            prune: "true"
+            self_heal: "true"
+
+  template:
+    metadata:
+      name: "{{env}}-monitoring"
+      namespace: argocd
+      labels:
+        app.kubernetes.io/part-of: de-platform
+        component: monitoring
+        environment: "{{env}}"
+      annotations:
+        notifications.argoproj.io/subscribe.on-sync-failed.slack: "de-alerts-{{env}}"
+
+    spec:
+      project: de-platform
+
+      source:
+        repoURL: "https://github.com/<ORG>/de-platform.git"  # PLACEHOLDER
+        targetRevision: "{{branch}}"
+        path: "{{path}}"
+        directory:
+          recurse: true
+          exclude: "{*.md,**/helm/**,**/docs/**}"
+
+      destination:
+        server: "{{cluster}}"
+        namespace: monitoring
+
+      syncPolicy:
+        automated:
+          prune: "{{prune}}"
+          selfHeal: "{{self_heal}}"
+          allowEmpty: false
+        syncOptions:
+          - CreateNamespace=true
+          - PruneLast=true
+          - ApplyOutOfSyncOnly=true
+          - ServerSideApply=true
+          - RespectIgnoreDifferences=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 10s
+            factor: 2
+            maxDuration: 5m
+
+      ignoreDifferences:
+        - group: monitoring.coreos.com
+          kind: Prometheus
+          jsonPointers:
+            - /status
+        - group: monitoring.coreos.com
+          kind: Alertmanager
+          jsonPointers:
+            - /status
+        - group: ""
+          kind: PersistentVolumeClaim
+          jsonPointers:
+            - /status
+        - group: apps
+          kind: Deployment
+          jsonPointers:
+            - /spec/template/metadata/annotations

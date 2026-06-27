@@ -1,0 +1,113 @@
+# =============================================================================
+# STAGING KAFKA CLUSTER — Strimzi KRaft Mode
+# =============================================================================
+# 3-broker cluster, no tiered storage, no Cruise Control.
+# Separate controller + broker pools (unlike dev combined pool).
+# RF=3 matching prod for realistic staging validation.
+# =============================================================================
+
+apiVersion: kafka.strimzi.io/v1beta2
+kind: Kafka
+metadata:
+  name: de-kafka-cluster
+  namespace: kafka
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+  annotations:
+    strimzi.io/node-pools: enabled
+    strimzi.io/kraft: enabled
+
+spec:
+  kafka:
+    version: 3.7.0
+    metadataVersion: 3.7-IV4
+
+    listeners:
+      - name: tls
+        port: 9093
+        type: internal
+        tls: true
+        authentication:
+          type: scram-sha-512
+        networkPolicyPeers:
+          - namespaceSelector:
+              matchExpressions:
+                - key: kubernetes.io/metadata.name
+                  operator: In
+                  values:
+                    - kafka
+                    - kafka-connect
+                    - schema-registry
+                    - flink
+                    - spark
+                    - monitoring
+
+    authorization:
+      type: simple
+      superUsers:
+        - User:kafka-admin
+        - User:strimzi-kafka-user
+
+    config:
+      offsets.topic.replication.factor: 3
+      transaction.state.log.replication.factor: 3
+      transaction.state.log.min.isr: 2
+      default.replication.factor: 3
+      min.insync.replicas: 2
+      socket.send.buffer.bytes: 102400
+      socket.receive.buffer.bytes: 102400
+      socket.request.max.bytes: 104857600
+      log.retention.hours: 72             # 3 days in staging
+      log.segment.bytes: 1073741824
+      log.retention.check.interval.ms: 300000
+      num.io.threads: 8
+      num.network.threads: 4
+      num.replica.fetchers: 2
+      compression.type: lz4
+      auto.create.topics.enable: "false"
+      delete.topic.enable: "true"
+      group.initial.rebalance.delay.ms: 3000
+
+    rack:
+      topologyKey: topology.kubernetes.io/zone
+
+    metricsConfig:
+      type: jmxPrometheusExporter
+      valueFrom:
+        configMapKeyRef:
+          name: kafka-jmx-exporter-config
+          key: kafka-metrics-config.yml
+
+    readinessProbe:
+      initialDelaySeconds: 30
+      timeoutSeconds: 5
+      failureThreshold: 3
+      periodSeconds: 10
+
+    livenessProbe:
+      initialDelaySeconds: 60
+      timeoutSeconds: 5
+      failureThreshold: 3
+      periodSeconds: 10
+
+  entityOperator:
+    topicOperator:
+      resources:
+        requests:
+          memory: 256Mi
+          cpu: "0.1"
+        limits:
+          memory: 512Mi
+          cpu: "0.3"
+      reconciliationIntervalSeconds: 90
+
+    userOperator:
+      resources:
+        requests:
+          memory: 256Mi
+          cpu: "0.1"
+        limits:
+          memory: 512Mi
+          cpu: "0.3"
+      reconciliationIntervalSeconds: 90

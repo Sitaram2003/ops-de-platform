@@ -1,0 +1,318 @@
+# =============================================================================
+# JOB: CLICKSTREAM PROCESSOR — Staging
+# =============================================================================
+# parallelism: 4 (between dev:2 and prod:6)
+# upgradeMode: savepoint
+# bucket: de-platform-staging-flink
+# =============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickstream-processor-script
+  namespace: flink
+  labels:
+    app.kubernetes.io/name: clickstream-processor
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+data:
+  clickstream_processor.py: |
+    """
+    Clickstream Processor — Staging
+
+    Reads raw clickstream events from Kafka, aggregates into 1-minute tumbling
+    windows (count per user_id + page), and writes to an output Kafka topic.
+
+    Consumer group: flink-clickstream-job
+    Source topic:   app.clickstream.events
+    Sink topic:     analytics.clickstream.1min
+    """
+
+    import os
+    import logging
+    from pyflink.table import EnvironmentSettings, TableEnvironment
+    from pyflink.table.window import Tumble
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
+    log = logging.getLogger("clickstream-processor")
+
+
+    def main():
+        settings = EnvironmentSettings.in_streaming_mode()
+        t_env = TableEnvironment.create(settings)
+
+        cfg = t_env.get_config()
+        cfg.set("execution.checkpointing.interval", "60s")
+        cfg.set("execution.checkpointing.mode", "EXACTLY_ONCE")
+        cfg.set("state.backend", "rocksdb")
+        cfg.set("state.backend.incremental", "true")
+        cfg.set("state.backend.rocksdb.memory.managed", "true")
+        cfg.set(
+            "state.checkpoints.dir",
+            f"s3://{os.environ['FLINK_S3_BUCKET']}/checkpoints/clickstream",
+        )
+        cfg.set(
+            "state.savepoints.dir",
+            f"s3://{os.environ['FLINK_S3_BUCKET']}/savepoints/clickstream",
+        )
+        cfg.set("restart-strategy", "exponential-delay")
+        cfg.set("restart-strategy.exponential-delay.initial-backoff", "1s")
+        cfg.set("restart-strategy.exponential-delay.max-backoff", "5min")
+        cfg.set("restart-strategy.exponential-delay.multiplier", "2.0")
+
+        bootstrap = os.environ["KAFKA_BOOTSTRAP_SERVERS"]
+        username = os.environ["KAFKA_USERNAME"]
+        password = os.environ["KAFKA_PASSWORD"]
+        environment = os.environ.get("ENVIRONMENT", "staging")
+
+        sasl_jaas = (
+            "org.apache.kafka.common.security.scram.ScramLoginModule required "
+            f'username="{username}" password="{password}";'
+        )
+
+        kafka_security = f"""
+            'properties.security.protocol'       = 'SASL_SSL',
+            'properties.sasl.mechanism'           = 'SCRAM-SHA-512',
+            'properties.sasl.jaas.config'         = '{sasl_jaas}',
+            'properties.ssl.truststore.location'  = '/opt/flink/certs/kafka-ca.p12',
+            'properties.ssl.truststore.type'      = 'PKCS12',
+            'properties.ssl.truststore.password'  = 'changeit'
+        """
+
+        t_env.execute_sql(f"""
+            CREATE TABLE clickstream_events (
+                user_id       STRING,
+                session_id    STRING,
+                page          STRING,
+                event_type    STRING,
+                event_time    TIMESTAMP(3),
+                WATERMARK FOR event_time AS event_time - INTERVAL '5' SECOND
+            ) WITH (
+                'connector'                          = 'kafka',
+                'topic'                              = 'app.clickstream.events',
+                'properties.bootstrap.servers'       = '{bootstrap}',
+                'properties.group.id'                = 'flink-clickstream-job',
+                {kafka_security},
+                'scan.startup.mode'                  = 'latest-offset',
+                'format'                             = 'json',
+                'json.fail-on-missing-field'         = 'false',
+                'json.ignore-parse-errors'           = 'true'
+            )
+        """)
+
+        t_env.execute_sql(f"""
+            CREATE TABLE clickstream_1min_agg (
+                window_start  TIMESTAMP(3),
+                window_end    TIMESTAMP(3),
+                user_id       STRING,
+                page          STRING,
+                event_count   BIGINT,
+                environment   STRING,
+                PRIMARY KEY (window_start, user_id, page) NOT ENFORCED
+            ) WITH (
+                'connector'                          = 'upsert-kafka',
+                'topic'                              = 'analytics.clickstream.1min',
+                'properties.bootstrap.servers'       = '{bootstrap}',
+                {kafka_security},
+                'key.format'                         = 'json',
+                'value.format'                       = 'json'
+            )
+        """)
+
+        log.info("Tables defined. Starting clickstream aggregation job (staging).")
+
+        stmt = t_env.create_statement_set()
+        stmt.add_insert_sql(f"""
+            INSERT INTO clickstream_1min_agg
+            SELECT
+                TUMBLE_START(event_time, INTERVAL '1' MINUTE) AS window_start,
+                TUMBLE_END(event_time, INTERVAL '1' MINUTE)   AS window_end,
+                user_id,
+                page,
+                COUNT(*)                                       AS event_count,
+                '{environment}'                                AS environment
+            FROM clickstream_events
+            GROUP BY
+                TUMBLE(event_time, INTERVAL '1' MINUTE),
+                user_id,
+                page
+        """)
+
+        stmt.execute().wait()
+
+
+    if __name__ == "__main__":
+        main()
+
+---
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: clickstream-processor
+  namespace: flink
+  labels:
+    app.kubernetes.io/name: clickstream-processor
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+spec:
+  image: 123456789012.dkr.ecr.ap-south-1.amazonaws.com/flink-platform:1.18.1
+  imagePullPolicy: Always
+  flinkVersion: v1_18
+  serviceAccount: flink-sa
+
+  flinkConfiguration:
+    taskmanager.numberOfTaskSlots: "2"
+    state.backend: rocksdb
+    state.backend.incremental: "true"
+    state.backend.rocksdb.memory.managed: "true"
+    state.checkpoints.dir: s3://de-platform-staging-flink/checkpoints/clickstream
+    state.savepoints.dir: s3://de-platform-staging-flink/savepoints/clickstream
+    execution.checkpointing.interval: "60000"
+    execution.checkpointing.mode: EXACTLY_ONCE
+    execution.checkpointing.timeout: "300000"
+    execution.checkpointing.min-pause: "30000"
+    execution.checkpointing.max-concurrent-checkpoints: "1"
+    restart-strategy: exponential-delay
+    restart-strategy.exponential-delay.initial-backoff: 1s
+    restart-strategy.exponential-delay.max-backoff: 5min
+    restart-strategy.exponential-delay.multiplier: "2.0"
+    metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+    metrics.reporter.prom.port: "9249"
+    s3.access-key: ""
+    s3.secret-key: ""
+    fs.s3a.aws.credentials.provider: com.amazonaws.auth.WebIdentityTokenCredentialsProvider
+
+  podTemplate:
+    spec:
+      serviceAccountName: flink-sa
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: flink
+          effect: NoSchedule
+      initContainers:
+        - name: cert-converter
+          image: eclipse-temurin:11-jre-alpine
+          command:
+            - sh
+            - -c
+            - |
+              keytool -importcert -trustcacerts -noprompt \
+                -alias kafka-ca \
+                -file /certs-src/ca.crt \
+                -keystore /opt/flink/certs/kafka-ca.p12 \
+                -storetype PKCS12 \
+                -storepass changeit
+          volumeMounts:
+            - name: kafka-ca-cert
+              mountPath: /certs-src
+              readOnly: true
+            - name: flink-certs
+              mountPath: /opt/flink/certs
+      volumes:
+        - name: clickstream-script
+          configMap:
+            name: clickstream-processor-script
+        - name: kafka-ca-cert
+          secret:
+            secretName: de-kafka-cluster-cluster-ca-cert
+        - name: flink-certs
+          emptyDir: {}
+
+  jobManager:
+    resource:
+      memory: "2048m"
+      cpu: 1
+    podTemplate:
+      spec:
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: role
+                      operator: In
+                      values:
+                        - flink
+        env:
+          - name: KAFKA_USERNAME
+            valueFrom:
+              secretKeyRef:
+                name: flink-processor
+                key: user
+          - name: KAFKA_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: flink-processor
+                key: password
+          - name: KAFKA_BOOTSTRAP_SERVERS
+            value: "de-kafka-cluster-kafka-tls-bootstrap.kafka.svc:9093"
+          - name: FLINK_S3_BUCKET
+            value: "de-platform-staging-flink"
+          - name: ENVIRONMENT
+            value: "staging"
+        volumeMounts:
+          - name: clickstream-script
+            mountPath: /opt/flink/scripts
+          - name: flink-certs
+            mountPath: /opt/flink/certs
+
+  taskManager:
+    resource:
+      memory: "6144m"
+      cpu: 1
+    podTemplate:
+      spec:
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: role
+                      operator: In
+                      values:
+                        - flink
+        containers:
+          - name: flink-main-container
+            resources:
+              requests:
+                memory: "6Gi"
+                cpu: "1"
+              limits:
+                memory: "8Gi"
+                cpu: "2"
+        env:
+          - name: KAFKA_USERNAME
+            valueFrom:
+              secretKeyRef:
+                name: flink-processor
+                key: user
+          - name: KAFKA_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: flink-processor
+                key: password
+          - name: KAFKA_BOOTSTRAP_SERVERS
+            value: "de-kafka-cluster-kafka-tls-bootstrap.kafka.svc:9093"
+          - name: FLINK_S3_BUCKET
+            value: "de-platform-staging-flink"
+          - name: ENVIRONMENT
+            value: "staging"
+        volumeMounts:
+          - name: clickstream-script
+            mountPath: /opt/flink/scripts
+          - name: flink-certs
+            mountPath: /opt/flink/certs
+
+  job:
+    jarURI: local:///opt/flink/opt/flink-python_2.12-1.18.1.jar
+    entryClass: org.apache.flink.client.python.PythonDriver
+    args:
+      - "-py"
+      - "/opt/flink/scripts/clickstream_processor.py"
+    parallelism: 4     # Between dev (2) and prod (6)
+    upgradeMode: savepoint
+    state: running

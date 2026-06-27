@@ -1,0 +1,36 @@
+# =============================================================================
+# POD DISRUPTION BUDGET — Kafka Connect Workers (Prod)
+# =============================================================================
+# Kafka Connect runs as a distributed cluster of 3 worker pods
+# (KafkaConnect CR: de-connect-cluster in kafka-connect namespace).
+# Workers coordinate via internal Kafka topics. During a node drain:
+#   - If 2 workers are evicted simultaneously, only 1 worker remains
+#   - Running connectors (Debezium CDC, S3 Sink) have their tasks rebalanced
+#     to the remaining worker, but the rebalance takes 30-60 seconds
+#   - If ALL workers are evicted, CDC stops entirely — transaction events
+#     are buffered in PostgreSQL WAL and MySQL binlog, but lag accumulates
+#
+# maxUnavailable: 1 permits draining one node at a time, ensuring at least
+# 2 workers remain available for rebalancing connector tasks.
+#
+# Selector: Strimzi labels KafkaConnect worker pods with
+#   strimzi.io/cluster=de-connect-cluster and strimzi.io/kind=KafkaConnect
+# =============================================================================
+
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: kafka-connect-pdb
+  namespace: kafka-connect
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+  annotations:
+    argocd.argoproj.io/sync-wave: "+5"
+spec:
+  maxUnavailable: 1    # Allow draining 1 node at a time; 2 workers always available
+  selector:
+    matchLabels:
+      strimzi.io/cluster: de-connect-cluster    # Strimzi label on all Connect worker pods
+      strimzi.io/kind: KafkaConnect
+</content>

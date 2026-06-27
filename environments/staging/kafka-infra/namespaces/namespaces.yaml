@@ -1,0 +1,186 @@
+# =============================================================================
+# STAGING NAMESPACES
+# =============================================================================
+# Adapted from prod — same namespace structure with staging labels and
+# intermediate resource quotas (between dev and prod).
+# =============================================================================
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kafka
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+    team: data-engineering
+  annotations:
+    sidecar.istio.io/inject: "false"
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kafka-connect
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+    team: data-engineering
+  annotations:
+    sidecar.istio.io/inject: "false"
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: schema-registry
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+    team: data-engineering
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+    team: platform-sre
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: external-secrets
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+    team: platform-sre
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: flink
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+    team: data-engineering
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: spark
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+    team: data-engineering
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: airflow
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+    team: data-engineering
+
+---
+# ─── Resource Quota: Kafka Namespace ─────────────────────────────────────────
+# Staging: 3 brokers × smaller r5.xlarge (4 vCPU, 32GB) + controllers + headroom
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: kafka-quota
+  namespace: kafka
+spec:
+  hard:
+    requests.cpu: "30"
+    requests.memory: "100Gi"
+    limits.cpu: "60"
+    limits.memory: "200Gi"
+    persistentvolumeclaims: "15"
+    pods: "15"
+
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: kafka-connect-quota
+  namespace: kafka-connect
+spec:
+  hard:
+    requests.cpu: "10"
+    requests.memory: "30Gi"
+    limits.cpu: "20"
+    limits.memory: "60Gi"
+    pods: "10"
+
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: flink-limits
+  namespace: flink
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: "2"
+        memory: 8Gi
+      defaultRequest:
+        cpu: "1"
+        memory: 6Gi
+      max:
+        cpu: "4"
+        memory: 10Gi
+
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: spark-quota
+  namespace: spark
+spec:
+  hard:
+    requests.cpu: "80"
+    requests.memory: "320Gi"
+    limits.cpu: "120"
+    limits.memory: "480Gi"
+    pods: "40"
+
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: spark-limits
+  namespace: spark
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: "2"
+        memory: 8Gi
+      defaultRequest:
+        cpu: "2"
+        memory: 8Gi
+      max:
+        cpu: "4"
+        memory: 16Gi
+
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: airflow-quota
+  namespace: airflow
+spec:
+  hard:
+    requests.cpu: "8"
+    requests.memory: "16Gi"
+    limits.cpu: "16"
+    limits.memory: "32Gi"
+    pods: "20"

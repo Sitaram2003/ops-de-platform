@@ -1,0 +1,150 @@
+# =============================================================================
+# FLINK ALERT RULES — PrometheusRule (Prod)
+# =============================================================================
+# Two severity levels (same routing as Kafka rules):
+#   critical → PagerDuty + Slack #de-incidents-prod  (immediate page)
+#   warning  → Slack #de-alerts-prod only            (business hours)
+#
+# Alert flow (same as Kafka):
+#   PrometheusRule → Prometheus evaluates every 30s → Alertmanager
+#   → AlertmanagerConfig routes by (severity, team) → PagerDuty / Slack
+#
+# Tuning notes:
+#   • "for" durations are conservative — brief metric gaps (scrape missed, JM restart)
+#     should not page on-call. Flink jobs briefly report uptime=0 during upgrade.
+#   • Thresholds chosen for the specific jobs on this platform:
+#       clickstream: ~50K records/min normal throughput
+#       CDC: lower volume but stricter checkpoint requirements
+#       GPS: TBD (placeholder job not yet deployed)
+# =============================================================================
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: flink-alert-rules
+  namespace: monitoring
+  labels:
+    prometheus: kube-prometheus
+    role: alert-rules
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+spec:
+  groups:
+
+    # ─── CRITICAL: Job Health ─────────────────────────────────────────────────
+    - name: flink.critical.jobs
+      interval: 30s
+      rules:
+
+        # Job uptime = 0 means the job is not in RUNNING state.
+        # Allow 2min before paging — Flink briefly dips to 0 during savepoint upgrades.
+        # After 2min with uptime=0, the job has failed and is not auto-recovering.
+        - alert: FlinkJobNotRunning
+          expr: flink_jobmanager_job_uptime == 0
+          for: 2m
+          labels:
+            severity: critical
+            team: data-engineering
+            service: flink
+          annotations:
+            summary: "Flink job {{ $labels.flink_job }} is not running"
+            description: |
+              FlinkDeployment '{{ $labels.flink_job }}' job uptime has been 0 for 2+ minutes.
+              The job may have crashed or is stuck in RESTARTING state.
+              Check:
+                kubectl get flinkdeployment -n flink {{ $labels.flink_job }}
+                kubectl logs -n flink -l app={{ $labels.flink_job }} --tail=100
+              If state is FAILED: trigger savepoint recovery or stateless restart.
+            runbook: "https://wiki.internal/runbooks/flink/job-not-running"
+
+        # Checkpoint failure spike: > 3 failed checkpoints in 10 minutes
+        # Causes: S3 unreachable, RocksDB state backend OOM, network partition
+        # A single failure (transient) is OK; a spike indicates a persistent issue
+        - alert: FlinkCheckpointFailureSpike
+          expr: increase(flink_jobmanager_job_numberOfFailedCheckpoints[10m]) > 3
+          for: 0m    # Alert immediately on spike — no need to wait
+          labels:
+            severity: critical
+            team: data-engineering
+            service: flink
+          annotations:
+            summary: "Flink job {{ $labels.flink_job }} had {{ $value | humanize }} checkpoint failures in 10 minutes"
+            description: |
+              More than 3 checkpoint failures in 10 minutes for job '{{ $labels.flink_job }}'.
+              With exactly-once semantics enabled, this risks message re-processing on restart.
+              Likely causes:
+                1. S3 unreachable (check IAM role, bucket policy)
+                2. RocksDB state OOM (TM memory limit too low)
+                3. Network instability between TMs
+              Check: kubectl logs -n flink -l component=taskmanager -l app={{ $labels.flink_job }}
+            runbook: "https://wiki.internal/runbooks/flink/checkpoint-failure"
+
+    # ─── WARNING: Stability ───────────────────────────────────────────────────
+    - name: flink.warning.stability
+      interval: 30s
+      rules:
+
+        # High restart rate: > 5 restarts in 30 minutes
+        # Indicates an unstable job (deserialization error, schema mismatch, OOM)
+        # KEDA will be scaling up TMs at the same time, which masks root cause
+        - alert: FlinkHighRestartRate
+          expr: increase(flink_jobmanager_numRestarts[30m]) > 5
+          for: 0m
+          labels:
+            severity: warning
+            team: data-engineering
+            service: flink
+          annotations:
+            summary: "Flink job {{ $labels.flink_job }} restarted {{ $value | humanize }} times in 30 minutes"
+            description: |
+              High restart rate for job '{{ $labels.flink_job }}'.
+              Frequent restarts mean the job is not stable — investigate before it escalates to FAILED.
+              Common causes: deserialization exception (check schema), OOME (increase TM memory),
+              Kafka topic ACL issue (check KafkaUser permissions).
+            runbook: "https://wiki.internal/runbooks/flink/high-restart-rate"
+
+        # Backpressure: > 50% of tasks are backpressured for 5 consecutive minutes
+        # Means the job cannot process records as fast as they arrive from Kafka
+        # KEDA should scale out TMs, but if scaling is capped (maxReplicaCount reached)
+        # backpressure will persist indefinitely → consumer lag grows → alert fires
+        - alert: FlinkBackpressureHigh
+          expr: avg by (flink_job) (flink_taskmanager_job_task_isBackPressured) > 0.5
+          for: 5m
+          labels:
+            severity: warning
+            team: data-engineering
+            service: flink
+          annotations:
+            summary: "Flink job {{ $labels.flink_job }} is {{ $value | humanizePercentage }} backpressured"
+            description: |
+              More than 50% of tasks are backpressured for 5+ minutes in job '{{ $labels.flink_job }}'.
+              KEDA should be scaling out TMs — check ScaledObject:
+                kubectl get scaledobject -n flink
+              If KEDA is at maxReplicaCount (120 for clickstream, 60 for CDC):
+                Either increase maxReplicaCount or investigate the slow downstream sink
+                (Kafka upsert-kafka connector or Snowflake write in Flink SQL).
+            runbook: "https://wiki.internal/runbooks/flink/backpressure"
+
+        # Low throughput alert: records processed < 100/sec for 10 minutes
+        # During normal operation, clickstream sees ~800 records/sec per TM
+        # A drop to near-zero means the job is running but not consuming
+        - alert: FlinkLowThroughput
+          expr: |
+            sum by (flink_job) (
+              flink_taskmanager_job_task_numRecordsInPerSecond
+            ) < 100
+          for: 10m
+          labels:
+            severity: warning
+            team: data-engineering
+            service: flink
+          annotations:
+            summary: "Flink job {{ $labels.flink_job }} throughput dropped to {{ $value | humanize }} records/sec"
+            description: |
+              Job '{{ $labels.flink_job }}' is processing fewer than 100 records/second for 10+ minutes.
+              May indicate: Kafka topic is empty (expected during off-hours), connector issue,
+              or job is stuck waiting on a slow operator (e.g., state backend flush).
+              Check consumer lag: kubectl exec -n kafka <broker-pod> -- \
+                kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+                --group flink-{{ $labels.flink_job }}-job --describe
+            runbook: "https://wiki.internal/runbooks/flink/low-throughput"

@@ -1,0 +1,50 @@
+# =============================================================================
+# AIRFLOW — ArgoCD Application (Staging)
+# =============================================================================
+# Manual sync only — no automated prune/selfHeal.
+# targetRevision: main branch.
+# =============================================================================
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: airflow-staging
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    component: airflow
+    environment: staging
+  annotations:
+    argocd.argoproj.io/sync-wave: "-5"
+spec:
+  project: de-platform
+  sources:
+    - repoURL: https://airflow.apache.org
+      chart: airflow
+      targetRevision: 1.15.0
+      helm:
+        valueFiles:
+          - $values/environments/staging/airflow/helm-values.yaml
+
+    - repoURL: https://github.com/your-org/de-platform.git
+      targetRevision: main
+      ref: values
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: airflow
+
+  syncPolicy:
+    automated: null   # Manual sync — staging requires explicit approval
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas
+    - group: ""
+      kind: Secret
+      jsonPointers:
+        - /data

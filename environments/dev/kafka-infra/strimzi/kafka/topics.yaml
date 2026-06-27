@@ -1,0 +1,117 @@
+# =============================================================================
+# DEV KAFKA TOPICS
+# =============================================================================
+# Dev topic differences from prod:
+#   • partitions: reduced (1/10 of prod) — dev traffic is low, saves resources
+#   • replicas: 1 (dev has 1 broker — RF=3 would fail without 3 brokers)
+#   • min.insync.replicas: 1 (single replica)
+#   • retention: shorter (1 day instead of 7)
+#   • No tiered storage (local.retention.ms not set, remote.storage.enable: false)
+#   • No DLQ topics (simplify dev environment)
+#
+# Topic names are IDENTICAL to prod — dev consumers/producers use same code.
+# Only the partition count and RF differ.
+# =============================================================================
+
+# ─── 1. CLICKSTREAM EVENTS (DEV) ─────────────────────────────────────────────
+# 12 partitions (vs 120 in prod) — supports 12 parallel TMs in dev
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: app-clickstream-events
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: de-kafka-cluster
+    environment: dev
+spec:
+  topicName: app.clickstream.events
+  partitions: 12
+  replicas: 1
+  config:
+    min.insync.replicas: "1"
+    retention.ms: "86400000"         # 1 day
+    cleanup.policy: delete
+    compression.type: lz4
+    max.message.bytes: "10485760"
+
+---
+# ─── 2. CDC TRANSACTIONS (DEV) ───────────────────────────────────────────────
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: cdc-transactions-db
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: de-kafka-cluster
+    environment: dev
+spec:
+  topicName: cdc.postgres-app-db
+  partitions: 6
+  replicas: 1
+  config:
+    min.insync.replicas: "1"
+    cleanup.policy: compact,delete
+    segment.ms: "3600000"
+    delete.retention.ms: "86400000"
+    max.message.bytes: "5242880"
+
+---
+# ─── 3. GPS LOCATION EVENTS (DEV) ────────────────────────────────────────────
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: gps-location-events
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: de-kafka-cluster
+    environment: dev
+spec:
+  topicName: app.gps.location.events
+  partitions: 24                     # 24 (vs 240 in prod)
+  replicas: 1
+  config:
+    min.insync.replicas: "1"
+    retention.ms: "86400000"
+    cleanup.policy: delete
+    compression.type: lz4
+    max.message.bytes: "1048576"
+
+---
+# ─── 4. MICROSERVICE EVENTS (DEV) ────────────────────────────────────────────
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: microservice-events
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: de-kafka-cluster
+    environment: dev
+spec:
+  topicName: app.microservice.events
+  partitions: 6
+  replicas: 1
+  config:
+    min.insync.replicas: "1"
+    retention.ms: "86400000"
+    cleanup.policy: delete
+    compression.type: lz4
+
+---
+# ─── 5. PROCESSED EVENTS OUTPUT (DEV) ─────────────────────────────────────────
+# Flink writes to this topic. Created here to avoid Flink needing CREATE ACL in dev.
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: processed-events
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: de-kafka-cluster
+    environment: dev
+spec:
+  topicName: processed.enriched.events
+  partitions: 6
+  replicas: 1
+  config:
+    min.insync.replicas: "1"
+    retention.ms: "86400000"
+    cleanup.policy: delete

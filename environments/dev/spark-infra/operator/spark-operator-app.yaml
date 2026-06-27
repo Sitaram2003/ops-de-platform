@@ -1,0 +1,65 @@
+# =============================================================================
+# SPARK OPERATOR — ArgoCD Application (Dev only)
+# =============================================================================
+# Dev operator application is managed separately from prod so dev auto-syncs
+# without touching the prod operator.
+#
+# This file lives in environments/dev/spark-infra/operator/ and is picked up
+# by the dev-spark ArgoCD Application (spark-applicationset.yaml).
+# =============================================================================
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: spark-operator-dev
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    component: spark-operator
+    environment: dev
+  annotations:
+    argocd.argoproj.io/sync-wave: "-5"
+spec:
+  project: de-platform
+  source:
+    repoURL: https://googlecloudplatform.github.io/spark-on-k8s-operator
+    chart: spark-operator
+    targetRevision: 1.1.27
+
+    helm:
+      values: |
+        resources:
+          requests:
+            memory: 128Mi
+            cpu: "0.1"
+          limits:
+            memory: 256Mi
+            cpu: "0.3"
+        tolerations:
+          - key: dedicated
+            operator: Equal
+            value: operators
+            effect: NoSchedule
+        sparkJobNamespace: spark
+        webhook:
+          enable: true
+          port: 8080
+        metrics:
+          enable: true
+          port: 10254
+          portName: metrics
+          endpoint: /metrics
+        batchScheduler:
+          enable: false
+
+  destination:
+    server: https://kubernetes.default.svc   # PLACEHOLDER: dev cluster API endpoint
+    namespace: spark
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

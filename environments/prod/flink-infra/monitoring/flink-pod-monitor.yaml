@@ -1,0 +1,73 @@
+# =============================================================================
+# FLINK POD MONITOR — Prometheus Scrape Config (Prod)
+# =============================================================================
+# Scrapes Prometheus metrics from ALL Flink JobManager and TaskManager pods
+# in the flink namespace. Metrics are exposed on port 9249 by the
+# PrometheusReporterFactory configured in each FlinkDeployment:
+#
+#   metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+#   metrics.reporter.prom.port: "9249"
+#
+# Why PodMonitor over ServiceMonitor:
+#   Strimzi and Flink Operator both recommend PodMonitor — it scrapes each pod
+#   directly, so per-TM metrics (backpressure, numRecords) are labeled by pod.
+#   A ServiceMonitor would round-robin across TMs, losing pod-level labels.
+#
+# Metric categories (Flink 1.18 Prometheus reporter):
+#   JobManager:
+#     flink_jobmanager_job_uptime              — ms since job started (0 = not running)
+#     flink_jobmanager_job_numberOfFailedCheckpoints
+#     flink_jobmanager_job_numberOfCompletedCheckpoints
+#     flink_jobmanager_numRestarts             — cumulative restart count
+#   TaskManager (per-task):
+#     flink_taskmanager_job_task_numRecordsInPerSecond
+#     flink_taskmanager_job_task_numRecordsOutPerSecond
+#     flink_taskmanager_job_task_isBackPressured  — 0 or 1
+#     flink_taskmanager_Status_JVM_Memory_Heap_Used
+# =============================================================================
+
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: flink-pod-monitor
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+    prometheus: kube-prometheus   # Picked up by kube-prometheus-stack Prometheus
+spec:
+  namespaceSelector:
+    matchNames:
+      - flink
+
+  # Match all Flink JM + TM pods managed by the Flink Operator
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: de-platform
+
+  podMetricsEndpoints:
+    - targetPort: 9249             # Numeric port — Flink Operator does not name this port
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+
+      # ── Relabeling: add identifying labels to every scraped metric ──────────
+      relabelings:
+        # Pod name → labels each metric by broker pod (jm-0, tm-0, tm-1, ...)
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod
+
+        - sourceLabels: [__meta_kubernetes_pod_namespace]
+          targetLabel: namespace
+
+        # Flink component type: jobmanager or taskmanager
+        - sourceLabels: [__meta_kubernetes_pod_label_component]
+          targetLabel: flink_component
+
+        # FlinkDeployment name (job name) — from the app label set by Flink Operator
+        - sourceLabels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+          targetLabel: flink_job
+
+        # Node name — useful for correlating TM backpressure with node CPU
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node

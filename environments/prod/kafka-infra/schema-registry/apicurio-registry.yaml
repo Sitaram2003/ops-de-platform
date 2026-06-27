@@ -1,0 +1,165 @@
+# =============================================================================
+# APICURIO SCHEMA REGISTRY — PRODUCTION
+# =============================================================================
+# Schema Registry stores Avro/JSON/Protobuf schemas used by producers/consumers.
+# Prevents: schema drift (producer adds column → consumer breaks).
+# Enables: schema evolution (backward/forward compatible changes).
+#
+# How it works with Kafka:
+#   Producer: register schema → get schema_id (integer) → serialize: magic_byte + schema_id + avro_bytes
+#   Consumer: read schema_id from message → fetch schema from registry → deserialize
+#   Result: message is 5 bytes overhead (magic + id) vs full schema embedded (1KB+)
+#
+# Apicurio vs Confluent Schema Registry:
+#   Apicurio: Apache-licensed, free, supports Confluent-compatible API (/apis/ccompat/v6)
+#   Confluent: commercial license for clusters > 1 replica
+#   We use Apicurio — same wire protocol, Confluent Avro converter works with it.
+#
+# Storage backend: Apache Kafka (built-in)
+# Apicurio uses Kafka topics to store schemas — no separate database needed.
+# Schemas persist as long as the Kafka cluster is running.
+# =============================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apicurio-registry
+  namespace: schema-registry
+  labels:
+    app: apicurio-registry
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+spec:
+  replicas: 3                        # 3 replicas for HA (stateless — all read from Kafka backend)
+
+  selector:
+    matchLabels:
+      app: apicurio-registry
+
+  template:
+    metadata:
+      labels:
+        app: apicurio-registry
+        app.kubernetes.io/part-of: de-platform
+    spec:
+      serviceAccountName: default
+
+      containers:
+        - name: apicurio-registry
+          image: quay.io/apicurio/apicurio-registry-kafkasql:2.5.11.Final
+          ports:
+            - containerPort: 8080
+              name: http
+
+          env:
+            # ─── Kafka Backend ────────────────────────────────────────────
+            # Apicurio uses Kafka as its storage backend (via kafkasql variant)
+            # Schemas stored in Kafka topic → survives registry pod restarts
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: "de-kafka-cluster-kafka-tls-bootstrap.kafka:9093"
+
+            # TLS configuration for connecting to Strimzi Kafka
+            - name: REGISTRY_KAFKASQL_SECURITY_PROTOCOL
+              value: "SASL_SSL"
+            - name: REGISTRY_KAFKASQL_SASL_MECHANISM
+              value: "SCRAM-SHA-512"
+
+            # Schema Registry user credentials (from Strimzi KafkaUser 'schema-registry-user')
+            - name: REGISTRY_KAFKASQL_SASL_JAAS_CONFIG
+              valueFrom:
+                secretKeyRef:
+                  name: schema-registry-user   # Created by Strimzi KafkaUser CR
+                  key: sasl.jaas.config        # Pre-formatted JAAS config string
+
+            # TLS: trust the Strimzi cluster CA cert
+            - name: REGISTRY_KAFKASQL_SSL_TRUSTSTORE_TYPE
+              value: "PEM"
+            - name: REGISTRY_KAFKASQL_SSL_TRUSTSTORE_CERTIFICATES
+              valueFrom:
+                secretKeyRef:
+                  name: de-kafka-cluster-cluster-ca-cert
+                  key: ca.crt
+
+            # ─── API Compatibility ────────────────────────────────────────
+            # Confluent-compatible REST API endpoint (/apis/ccompat/v6)
+            # Kafka Connect AvroConverter sends requests here using Confluent protocol
+            - name: REGISTRY_APIS_COMPATIBILITY_CONFLUENT_API_ENABLED
+              value: "true"
+
+            # ─── Schema Validation ────────────────────────────────────────
+            # Reject schema registrations that break backward compatibility
+            # 'BACKWARD': new schema can read data written by old schema
+            # Prevents Flink consumers from breaking when producers add new columns
+            - name: REGISTRY_DEFAULT_COMPAT_MODE
+              value: "BACKWARD"
+
+            # ─── Performance ─────────────────────────────────────────────
+            - name: QUARKUS_HTTP_PORT
+              value: "8080"
+
+          resources:
+            requests:
+              memory: 512Mi
+              cpu: "0.5"
+            limits:
+              memory: 1Gi
+              cpu: "1"
+
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 3
+
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: operators
+          effect: NoSchedule
+
+---
+# ─── Schema Registry Service ──────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: apicurio-registry
+  namespace: schema-registry
+  labels:
+    app: apicurio-registry
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+spec:
+  # ClusterIP: reachable from Kafka Connect, Flink, Spark within the cluster
+  # DNS: apicurio-registry.schema-registry.svc:8080
+  type: ClusterIP
+  ports:
+    - port: 8080
+      targetPort: 8080
+      name: http
+  selector:
+    app: apicurio-registry
+
+---
+# ─── Prod PodDisruptionBudget ─────────────────────────────────────────────────
+# Ensures at least 2 registry replicas are available during K8s node drains
+# (voluntary disruptions like rolling node upgrades)
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: apicurio-registry-pdb
+  namespace: schema-registry
+spec:
+  minAvailable: 2                    # Keep 2 of 3 replicas available
+  selector:
+    matchLabels:
+      app: apicurio-registry

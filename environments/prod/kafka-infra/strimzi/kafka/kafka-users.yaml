@@ -1,0 +1,273 @@
+# =============================================================================
+# PROD KAFKA USERS — SCRAM-SHA-512 Authentication + ACLs
+# =============================================================================
+# Principle of least privilege: each service gets its own user with only the
+# permissions it needs. If one service is compromised, blast radius is limited
+# to its own topics — not the entire cluster.
+#
+# User → K8s Secret mapping:
+#   KafkaUser CR created → Strimzi UserOperator generates SCRAM credentials
+#   → stores in K8s Secret named after the user in the kafka namespace
+#   → services mount this secret to authenticate
+#
+# ACL syntax:
+#   resource.type: topic | group | transactionalId | cluster
+#   patternType: literal (exact match) | prefix (startsWith)
+#   operations: Read | Write | Describe | Create | Delete | Alter | DescribeConfigs
+# =============================================================================
+
+# ─── 1. CLICKSTREAM PRODUCER ──────────────────────────────────────────────────
+# Used by: mobile/web app producers publishing user events
+# Permissions: Write to clickstream topic only
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: clickstream-producer
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: de-kafka-cluster
+    app.kubernetes.io/part-of: de-platform
+    team: platform
+spec:
+  authentication:
+    type: scram-sha-512
+    # Strimzi creates K8s Secret 'clickstream-producer' in 'kafka' namespace with:
+    #   data.username = clickstream-producer
+    #   data.password = <generated SCRAM password>
+    # Client connects with: sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule
+    #   required username="clickstream-producer" password="<from-secret>";
+
+  authorization:
+    type: simple
+    acls:
+      # WRITE on the clickstream topic (specific topic, not wildcard)
+      - resource:
+          type: topic
+          name: app.clickstream.events
+          patternType: literal
+        operations:
+          - Write
+          - Describe              # Describe = metadata read — required for producers to find partition leader
+        host: "*"
+
+      # WRITE transactional IDs (for exactly-once producers)
+      # Without this: producer.initTransactions() fails with AuthorizationException
+      - resource:
+          type: transactionalId
+          name: clickstream-txn-
+          patternType: prefix      # Allows clickstream-txn-0, clickstream-txn-1, etc.
+        operations:
+          - Write
+        host: "*"
+
+---
+# ─── 2. FLINK STREAM PROCESSOR ────────────────────────────────────────────────
+# Used by: Flink jobs consuming raw events and writing processed results
+# Permissions: Read all app.* source topics, Write all processed.* output topics
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: flink-processor
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: de-kafka-cluster
+    app.kubernetes.io/part-of: de-platform
+    team: data-engineering
+spec:
+  authentication:
+    type: scram-sha-512
+  authorization:
+    type: simple
+    acls:
+      # READ all source event topics (app.* prefix = clickstream, GPS, microservice events)
+      - resource:
+          type: topic
+          name: app.
+          patternType: prefix
+        operations:
+          - Read
+          - Describe
+        host: "*"
+
+      # READ CDC topics (for Flink CDC enrichment jobs)
+      - resource:
+          type: topic
+          name: cdc.
+          patternType: prefix
+        operations:
+          - Read
+          - Describe
+        host: "*"
+
+      # READ consumer group for offset management
+      # Flink uses consumer groups to track which events have been processed
+      - resource:
+          type: group
+          name: flink-
+          patternType: prefix       # flink-clickstream-job, flink-cdc-enrichment, etc.
+        operations:
+          - Read
+          - Describe
+        host: "*"
+
+      # WRITE processed output topics (enriched events, aggregations)
+      - resource:
+          type: topic
+          name: processed.
+          patternType: prefix
+        operations:
+          - Write
+          - Describe
+          - Create                  # Flink auto-creates output topics on job startup
+        host: "*"
+
+      # WRITE transactional IDs (Flink uses Kafka transactions for exactly-once)
+      - resource:
+          type: transactionalId
+          name: flink-
+          patternType: prefix
+        operations:
+          - Write
+          - Describe
+        host: "*"
+
+---
+# ─── 3. SPARK BATCH PROCESSOR ─────────────────────────────────────────────────
+# Used by: Spark batch jobs reading processed events for aggregation and Snowflake load
+# Permissions: Read all processed.* topics + app.* (for backfill jobs)
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: spark-processor
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: de-kafka-cluster
+    app.kubernetes.io/part-of: de-platform
+    team: data-engineering
+spec:
+  authentication:
+    type: scram-sha-512
+  authorization:
+    type: simple
+    acls:
+      # READ processed events from Flink output (for batch aggregation jobs)
+      - resource:
+          type: topic
+          name: processed.
+          patternType: prefix
+        operations:
+          - Read
+          - Describe
+        host: "*"
+
+      # READ raw topics for backfill / replay jobs
+      - resource:
+          type: topic
+          name: app.
+          patternType: prefix
+        operations:
+          - Read
+          - Describe
+        host: "*"
+
+      # READ consumer group for Spark Structured Streaming offset tracking
+      - resource:
+          type: group
+          name: spark-
+          patternType: prefix
+        operations:
+          - Read
+          - Describe
+        host: "*"
+
+---
+# ─── 4. KAFKA CONNECT ──────────────────────────────────────────────────────────
+# Used by: Kafka Connect workers (Debezium CDC producers, S3 Sink consumers)
+# Permissions: Broad access needed — Debezium produces to cdc.*, S3 Sink reads all topics
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: kafka-connect-user
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: de-kafka-cluster
+    app.kubernetes.io/part-of: de-platform
+    team: data-engineering
+spec:
+  authentication:
+    type: scram-sha-512
+  authorization:
+    type: simple
+    acls:
+      # READ all topics (S3 Sink needs to consume any topic)
+      # WRITE cdc.* topics (Debezium produces CDC events here)
+      - resource:
+          type: topic
+          name: "*"
+          patternType: literal
+        operations:
+          - Read
+          - Write
+          - Describe
+          - Create                  # Debezium creates DLQ topics on first error
+        host: "*"
+
+      # Connect internal consumer groups (connect-cluster.*) for rebalance protocol
+      - resource:
+          type: group
+          name: connect-
+          patternType: prefix
+        operations:
+          - Read
+          - Write
+          - Describe
+        host: "*"
+
+      # S3 Sink named consumer groups
+      - resource:
+          type: group
+          name: s3-sink-
+          patternType: prefix
+        operations:
+          - Read
+          - Describe
+        host: "*"
+
+---
+# ─── 5. SCHEMA REGISTRY ───────────────────────────────────────────────────────
+# Used by: Apicurio Schema Registry for schema storage (uses Kafka as backend)
+# Permissions: Read/Write on internal Schema Registry topics
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: schema-registry-user
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: de-kafka-cluster
+    app.kubernetes.io/part-of: de-platform
+    team: data-engineering
+spec:
+  authentication:
+    type: scram-sha-512
+  authorization:
+    type: simple
+    acls:
+      # Schema Registry internal topics (_schemas, global-id-topic, etc.)
+      - resource:
+          type: topic
+          name: _schemas
+          patternType: literal
+        operations:
+          - Read
+          - Write
+          - Describe
+          - Create
+        host: "*"
+      - resource:
+          type: group
+          name: schema-registry-
+          patternType: prefix
+        operations:
+          - Read
+          - Describe
+        host: "*"

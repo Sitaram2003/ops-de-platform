@@ -1,0 +1,160 @@
+# =============================================================================
+# PROD S3 SINK CONNECTOR — CLICKSTREAM (Kafka → S3 Parquet)
+# =============================================================================
+# Consumes app.clickstream.events → writes Parquet files to S3.
+# Spark reads S3 path for daily batch analytics and Snowflake loads.
+#
+# File format choice:
+#   Parquet: columnar, compressed, self-describing. Spark, Athena, Snowflake read natively.
+#   vs JSON: row-oriented, verbose, slow for column-selective analytics.
+#   vs Avro: good for streaming, but Parquet is better for analytics at rest.
+#
+# Partitioning strategy: Hive-style time partitions using EVENT timestamp (not ingestion time)
+#   s3://de-data-lake-prod/clickstream/year=2025/month=06/day=15/hour=14/
+#   Why event time? User clicked at 23:58 → Kafka received at 00:02 (day boundary).
+#   Analytics query for Jan 1 must include the 23:58 event → event-time partitioning.
+#
+# File rotation:
+#   flush.size: 500K records per task OR rotate.interval.ms: 1 hour (whichever first)
+#   12 tasks × 500K = 6M records per file rotation → ~120MB Parquet files (optimal for Spark)
+# =============================================================================
+
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaConnector
+metadata:
+  name: s3-sink-clickstream
+  namespace: kafka-connect
+  labels:
+    strimzi.io/cluster: de-connect-cluster
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+spec:
+  class: io.confluent.connect.s3.S3SinkConnector
+  tasksMax: 12                       # 12 tasks for 120 partitions (10 partitions per task)
+
+  config:
+    topics: "app.clickstream.events"
+
+    # ─── S3 ──────────────────────────────────────────────────────────────
+    s3.region: ap-south-1
+    # PLACEHOLDER: update bucket from config/placeholders.yaml → s3.data_lake_prod
+    s3.bucket.name: "de-data-lake-prod"
+    s3.part.size: "67108864"           # 64MB multipart upload threshold (S3 minimum for efficiency)
+    s3.compression.type: snappy        # Snappy: native to Parquet, fast, moderate compression
+    s3.ssea.name: AES256               # Server-side encryption at rest (GDPR/SOC2 compliance)
+    s3.retry.backoff.ms: "5000"        # Wait 5s before retrying failed S3 API calls
+    s3.part.retries: "3"               # Retry each multipart part 3 times
+
+    # ─── Format ──────────────────────────────────────────────────────────
+    format.class: io.confluent.connect.s3.format.parquet.ParquetFormat
+    parquet.codec: snappy
+
+    # ─── File Rotation Policy ─────────────────────────────────────────────
+    # Rotate when EITHER condition is met (whichever happens first)
+    flush.size: "500000"               # 500K records per task → triggers file write
+    rotate.interval.ms: "3600000"      # Rotate every 1 hour (for low-traffic periods)
+    rotate.schedule.interval.ms: "3600000"  # Force rotation at wall-clock hour boundaries
+
+    # ─── Partitioning ─────────────────────────────────────────────────────
+    partitioner.class: io.confluent.connect.storage.partitioner.TimeBasedPartitioner
+    partition.duration.ms: "3600000"   # 1 hour partitions
+    path.format: "'year'=YYYY/'month'=MM/'day'=dd/'hour'=HH"
+    locale: en_IN
+    timezone: Asia/Kolkata             # IST — matches business timezone
+
+    # timestamp.extractor: RecordField — use event_timestamp FROM the message payload
+    # RecordField reads a specific field from the message value (event time)
+    # vs Kafka message timestamp (ingestion time — incorrect for day-boundary events)
+    timestamp.extractor: RecordField
+    timestamp.field: event_timestamp
+
+    # ─── Storage ─────────────────────────────────────────────────────────
+    storage.class: io.confluent.connect.s3.storage.S3Storage
+    topics.dir: clickstream            # s3://de-data-lake-prod/clickstream/year=.../...
+
+    # ─── Consumer Group ───────────────────────────────────────────────────
+    consumer.override.group.id: s3-sink-clickstream-cg
+
+    # ─── Schema Registry ─────────────────────────────────────────────────
+    # Avro schema → Parquet column types (INT64, STRING, BOOLEAN, etc.)
+    key.converter: org.apache.kafka.connect.storage.StringConverter
+    value.converter: io.confluent.connect.avro.AvroConverter
+    value.converter.schema.registry.url: http://apicurio-registry.schema-registry.svc:8080/apis/ccompat/v6
+
+    # ─── Error Handling ───────────────────────────────────────────────────
+    errors.tolerance: all
+    errors.deadletterqueue.topic.name: dlq.s3-sink.clickstream
+    errors.deadletterqueue.context.headers.enable: "true"
+    errors.deadletterqueue.topic.replication.factor: "3"
+    retry.backoff.ms: "5000"
+
+---
+# =============================================================================
+# PROD S3 SINK CONNECTOR — CDC BATCH (Kafka CDC topics → S3 Avro)
+# =============================================================================
+# Consumes all cdc.* topics → writes Avro files to S3.
+# Spark reads CDC Avro for daily historical loads and Snowflake upserts.
+#
+# Uses Avro (not Parquet) for CDC:
+#   WHY Avro? CDC topics use schema evolution (column adds/renames).
+#   Avro records embed schema ID → reader always knows the exact schema version.
+#   Parquet + CDC: column mismatches between old/new schemas cause read failures.
+#   Avro + Schema Registry: handles schema evolution gracefully (backward/forward compatible).
+#
+# Uses FieldPartitioner by table (route by source table for Spark's partition pruning)
+# =============================================================================
+
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaConnector
+metadata:
+  name: s3-sink-cdc-batch
+  namespace: kafka-connect
+  labels:
+    strimzi.io/cluster: de-connect-cluster
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+spec:
+  class: io.confluent.connect.s3.S3SinkConnector
+  tasksMax: 6                        # 6 tasks — CDC volume is lower than clickstream
+
+  config:
+    # Match all cdc.* topics using regex
+    topics.regex: "^cdc\\..*"
+
+    s3.region: ap-south-1
+    s3.bucket.name: "de-data-lake-prod"
+    s3.part.size: "67108864"
+    s3.ssea.name: AES256
+
+    # Avro format (not Parquet) for CDC — handles schema evolution
+    format.class: io.confluent.connect.s3.format.avro.AvroFormat
+
+    # Rotate: 100K records per task OR 24 hours (CDC volume lower than clickstream)
+    flush.size: "100000"
+    rotate.interval.ms: "86400000"     # 24 hours (daily files for Spark batch jobs)
+    rotate.schedule.interval.ms: "86400000"
+
+    # Field-based partitioning: route by topic (= source table)
+    # Path: s3://de-data-lake-prod/cdc/cdc.postgres-app-db.public.orders/year=.../
+    partitioner.class: io.confluent.connect.storage.partitioner.TimeBasedPartitioner
+    partition.duration.ms: "86400000"  # Daily partitions
+    path.format: "'year'=YYYY/'month'=MM/'day'=dd"
+    locale: en_IN
+    timezone: Asia/Kolkata
+    timestamp.extractor: RecordField
+    timestamp.field: ts_ms             # Debezium's transaction timestamp field
+
+    storage.class: io.confluent.connect.s3.storage.S3Storage
+    topics.dir: cdc
+
+    consumer.override.group.id: s3-sink-cdc-cg
+
+    key.converter: io.confluent.kafka.serializers.KafkaAvroSerializer
+    key.converter.schema.registry.url: http://apicurio-registry.schema-registry.svc:8080/apis/ccompat/v6
+    value.converter: io.confluent.kafka.serializers.KafkaAvroSerializer
+    value.converter.schema.registry.url: http://apicurio-registry.schema-registry.svc:8080/apis/ccompat/v6
+
+    errors.tolerance: all
+    errors.deadletterqueue.topic.name: dlq.s3-sink.cdc
+    errors.deadletterqueue.context.headers.enable: "true"
+    errors.deadletterqueue.topic.replication.factor: "3"

@@ -1,0 +1,81 @@
+# =============================================================================
+# NETWORK POLICIES — Flink Namespace (Prod)
+# =============================================================================
+# Flink uses direct pod-to-pod RPC for:
+#   JobManager → TaskManager: task deployment, heartbeats
+#   TaskManager → JobManager: result reporting, checkpoints
+#   JobManager REST API: port 8081 (Flink Operator + kubectl port-forward)
+#
+# Flink Prometheus metrics reporter exposes port 9249 on both JM and TM pods.
+# The PodMonitor (flink-pod-monitor.yaml) targets this port from the monitoring ns.
+# =============================================================================
+
+# Default deny: block all ingress from outside flink namespace.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: flink
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+  annotations:
+    argocd.argoproj.io/sync-wave: "+5"
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+
+---
+# Allow intra-namespace: JM ↔ TM RPC, blob server, REST API, and
+# Flink Operator → JM REST API calls for FlinkDeployment reconciliation.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-intra-namespace
+  namespace: flink
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+  annotations:
+    argocd.argoproj.io/sync-wave: "+5"
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {}    # Any pod in the flink namespace
+      ports:
+        - port: 6123    # JM RPC port (TM → JM task reporting)
+          protocol: TCP
+        - port: 6124    # JM blob server (job JARs + checkpoint data)
+          protocol: TCP
+        - port: 8081    # JM REST API (Flink Operator reconciliation, UI)
+          protocol: TCP
+
+---
+# Allow Prometheus to scrape Flink metrics (JM + TM pods on port 9249).
+# This matches the PodMonitor spec in flink-pod-monitor.yaml.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-scraping
+  namespace: flink
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+  annotations:
+    argocd.argoproj.io/sync-wave: "+5"
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: de-platform    # JM + TM pods labeled by FlinkDeployment
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 9249    # Prometheus metrics reporter (configured in FlinkDeployment)
+          protocol: TCP
+</content>

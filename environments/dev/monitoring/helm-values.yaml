@@ -1,0 +1,33 @@
+# kube-prometheus-stack Helm values — Dev
+# Shorter retention, no PagerDuty, minimal storage.
+
+prometheus:
+  prometheusSpec:
+    retention: 72h
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp3-general
+          resources:
+            requests:
+              storage: 10Gi
+
+alertmanager:
+  config:
+    global:
+      slack_api_url: "https://hooks.slack.com/services/PLACEHOLDER"
+    route:
+      group_by: [alertname, namespace]
+      receiver: slack-dev
+    receivers:
+      - name: slack-dev
+        slack_configs:
+          - channel: "#de-alerts-dev"
+            send_resolved: true
+
+grafana:
+  adminPassword: ""   # Set via grafana-admin-secret (ESO-managed)
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard

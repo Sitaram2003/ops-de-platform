@@ -1,0 +1,37 @@
+# =============================================================================
+# POD DISRUPTION BUDGET — Flink JobManager (Prod)
+# =============================================================================
+# The Flink JobManager is a single-replica Deployment managed by the Flink
+# Kubernetes Operator. If the JM pod is evicted during a node drain, ALL
+# running Flink jobs lose their coordinator:
+#   - Checkpointing stops immediately
+#   - Watermark progress halts
+#   - TaskManagers go into LOST_CONNECTION state
+#   - The Flink Operator triggers a savepoint-based restart, which takes
+#     several minutes (savepoint write → new JM pod → TM reconnect → restore)
+#
+# minAvailable: 1 ensures the existing JM pod must be Running before the
+# drain proceeds. The new JM pod from the replacement node must be scheduled
+# and ready before eviction is permitted.
+#
+# Note: Flink Kubernetes Operator 1.8 manages the JM Deployment and labels
+# JM pods with `component: jobmanager`. All FlinkDeployments in the flink
+# namespace have this label applied automatically.
+# =============================================================================
+
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: flink-jobmanager-pdb
+  namespace: flink
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+  annotations:
+    argocd.argoproj.io/sync-wave: "+5"
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      component: jobmanager    # Applied by Flink Operator to all JM pods
+</content>

@@ -1,0 +1,163 @@
+# =============================================================================
+# KEDA SCALED OBJECTS — PROD (Kafka consumer lag-driven auto-scaling)
+# =============================================================================
+# KEDA watches Kafka consumer group lag and signals Cluster Autoscaler to
+# provision/deprovision r5.2xlarge nodes in the flink-ng node group.
+#
+# Scaling architecture:
+#   Kafka lag → KEDA pollingInterval (15s)
+#     → desiredReplicas = ceil(totalLag / lagThreshold)
+#       → HPA adjusts target replica count
+#         → Cluster Autoscaler sees pending pods → provisions new r5.2xlarge nodes
+#
+# KEDA + Flink Operator interaction:
+#   These ScaledObjects target FlinkDeployment CRs. KEDA scales the job parallelism
+#   which the Flink Operator converts to TaskManager pod count.
+#   scaleTargetRef.kind: FlinkDeployment requires KEDA v2.12+ with CRD scaling support.
+#
+#   ALTERNATIVE (currently commented): use Flink Operator built-in Autoscaler.
+#   Enable by adding to FlinkDeployment.spec.flinkConfiguration:
+#     kubernetes.operator.autoscaler.enabled: "true"
+#     kubernetes.operator.autoscaler.metrics.window: 10m
+#     kubernetes.operator.autoscaler.target.utilization: "0.7"
+#   When using Flink Autoscaler, comment out these ScaledObjects (they'll conflict).
+# =============================================================================
+
+# ─── Flink TaskManager Scaler — Clickstream ───────────────────────────────────
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: flink-tm-clickstream-scaler
+  namespace: flink
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+spec:
+  scaleTargetRef:
+    apiVersion: flink.apache.org/v1beta1   # KEDA v2.12+ required for CRD scaling
+    kind: FlinkDeployment
+    name: clickstream-processor            # Must match FlinkDeployment metadata.name
+
+  pollingInterval: 15
+  cooldownPeriod: 300
+  minReplicaCount: 3
+  maxReplicaCount: 120                     # 120 = clickstream topic partition count
+
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: de-kafka-cluster-kafka-tls-bootstrap.kafka.svc:9093
+        consumerGroup: flink-clickstream-job   # Must match job script's group.id
+        topic: app.clickstream.events
+        lagThreshold: "1000"
+        activationLagThreshold: "10"
+        offsetResetPolicy: latest
+        allowIdleConsumers: "false"
+        scaleToZeroOnInvalidOffset: "false"
+      authenticationRef:
+        name: kafka-trigger-auth-flink
+
+---
+# ─── Flink TaskManager Scaler — CDC Enrichment ───────────────────────────────
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: flink-tm-cdc-scaler
+  namespace: flink
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+spec:
+  scaleTargetRef:
+    apiVersion: flink.apache.org/v1beta1
+    kind: FlinkDeployment
+    name: cdc-enrichment                   # Must match FlinkDeployment metadata.name
+  pollingInterval: 15
+  cooldownPeriod: 300
+  minReplicaCount: 2
+  maxReplicaCount: 60                      # CDC topic: 60 partitions
+
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: de-kafka-cluster-kafka-tls-bootstrap.kafka.svc:9093
+        consumerGroup: flink-cdc-enrichment-job
+        topic: cdc.postgres-app-db
+        lagThreshold: "500"
+        activationLagThreshold: "5"
+        offsetResetPolicy: earliest
+      authenticationRef:
+        name: kafka-trigger-auth-flink
+
+---
+# ─── TriggerAuthentication — Flink SCRAM credentials ─────────────────────────
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: kafka-trigger-auth-flink
+  namespace: flink
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+spec:
+  secretTargetRef:
+    - parameter: username
+      name: flink-processor
+      key: user
+    - parameter: password
+      name: flink-processor
+      key: password
+    - parameter: tls
+      name: flink-processor
+      key: tls
+    - parameter: ca
+      name: de-kafka-cluster-cluster-ca-cert
+      key: ca.crt
+
+---
+# ─── GPS Scaler (kept as-is — GPS FlinkDeployment to be added in next sprint) ─
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: flink-tm-gps-scaler
+  namespace: flink
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+spec:
+  scaleTargetRef:
+    apiVersion: flink.apache.org/v1beta1
+    kind: FlinkDeployment
+    name: gps-processor             # PLACEHOLDER: create gps-processor FlinkDeployment when GPS job is built
+  pollingInterval: 15
+  cooldownPeriod: 180
+  minReplicaCount: 3
+  maxReplicaCount: 120
+
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 60
+          policies:
+            - type: Pods
+              value: 20
+              periodSeconds: 60
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+            - type: Pods
+              value: 5
+              periodSeconds: 120
+
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: de-kafka-cluster-kafka-tls-bootstrap.kafka.svc:9093
+        consumerGroup: flink-gps-processing-job
+        topic: app.gps.location.events
+        lagThreshold: "2000"
+        activationLagThreshold: "20"
+        offsetResetPolicy: latest
+      authenticationRef:
+        name: kafka-trigger-auth-flink

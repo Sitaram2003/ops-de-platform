@@ -1,0 +1,154 @@
+# =============================================================================
+# FLINK OPERATOR — ArgoCD Application (Prod + Dev)
+# =============================================================================
+# The Flink Kubernetes Operator manages FlinkDeployment CRs.
+# Install BEFORE applying any FlinkDeployment YAML.
+#
+# ArgoCD sync-wave: -5 (after namespaces wave -10, before Flink jobs wave 0)
+#
+# What the operator does:
+#   • Watches FlinkDeployment + FlinkSessionJob CRs
+#   • Creates JM Deployment + TM pods for each FlinkDeployment
+#   • Handles upgrade strategy (savepoint → restart → restore)
+#   • Runs built-in autoscaler (adjusts parallelism based on throughput metrics)
+#   • Manages checkpoint lifecycle (cleanup old checkpoints after savepoint)
+#
+# Flink Operator v1.8 chosen for:
+#   • Native Kubernetes Autoscaler (no KEDA needed for Flink-level scaling)
+#   • FlinkDeployment upgrade modes: savepoint, last-state, stateless
+#   • Webhook validation for FlinkDeployment specs (catches misconfigs at apply time)
+# =============================================================================
+
+# ─── Prod ─────────────────────────────────────────────────────────────────────
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: flink-operator-prod
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    component: flink-operator
+    environment: prod
+  annotations:
+    argocd.argoproj.io/sync-wave: "-5"   # After namespaces (-10), before Flink jobs (0)
+spec:
+  project: de-platform
+  source:
+    repoURL: https://downloads.apache.org/flink/flink-kubernetes-operator-1.8.0/
+    chart: flink-kubernetes-operator
+    targetRevision: 1.8.0
+
+    helm:
+      values: |
+        # Operator pod resources (runs on operators-ng node group)
+        resources:
+          requests:
+            memory: 256Mi
+            cpu: "0.1"
+          limits:
+            memory: 512Mi
+            cpu: "0.5"
+
+        # Toleration + node affinity — land on operators-ng node group
+        tolerations:
+          - key: dedicated
+            operator: Equal
+            value: operators
+            effect: NoSchedule
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: role
+                      operator: In
+                      values:
+                        - operators
+
+        # Watch all namespaces where FlinkDeployments will be created
+        watchNamespaces:
+          - flink
+
+        # Webhook validation — catch bad FlinkDeployment specs at apply time
+        webhook:
+          create: true
+
+        # Operator default Flink configuration (can be overridden per FlinkDeployment)
+        defaultConfiguration:
+          create: true
+          append: true
+          flink-conf.yaml: |+
+            kubernetes.operator.reconcile.interval: 15s
+            kubernetes.operator.observer.progress-check.interval: 5s
+            # Autoscaler: enabled at operator level; each FlinkDeployment opts in via
+            # kubernetes.operator.autoscaler.enabled: "true" in spec.flinkConfiguration
+            kubernetes.operator.autoscaler.enabled: false
+            kubernetes.operator.autoscaler.metrics.window: 10m
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: flink
+
+  syncPolicy:
+    automated:
+      prune: false                 # Never auto-prune operator — would delete all FlinkDeployments
+      selfHeal: false
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+
+---
+# ─── Dev ──────────────────────────────────────────────────────────────────────
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: flink-operator-dev
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    component: flink-operator
+    environment: dev
+  annotations:
+    argocd.argoproj.io/sync-wave: "-5"
+spec:
+  project: de-platform
+  source:
+    repoURL: https://downloads.apache.org/flink/flink-kubernetes-operator-1.8.0/
+    chart: flink-kubernetes-operator
+    targetRevision: 1.8.0
+
+    helm:
+      values: |
+        resources:
+          requests:
+            memory: 128Mi
+            cpu: "0.1"
+          limits:
+            memory: 256Mi
+            cpu: "0.3"
+        tolerations:
+          - key: dedicated
+            operator: Equal
+            value: operators
+            effect: NoSchedule
+        watchNamespaces:
+          - flink
+        webhook:
+          create: true
+        defaultConfiguration:
+          create: true
+          append: true
+          flink-conf.yaml: |+
+            kubernetes.operator.reconcile.interval: 30s
+
+  destination:
+    server: https://kubernetes.default.svc   # PLACEHOLDER: dev cluster API endpoint
+    namespace: flink
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

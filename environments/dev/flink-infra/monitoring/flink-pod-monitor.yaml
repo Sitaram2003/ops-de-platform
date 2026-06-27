@@ -1,0 +1,41 @@
+# =============================================================================
+# FLINK POD MONITOR — Prometheus Scrape Config (Dev)
+# =============================================================================
+# Identical to prod — same port 9249, same metric names.
+# Dev jobs have lower parallelism (2 TMs), so aggregate queries return lower values.
+# =============================================================================
+
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: flink-pod-monitor
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: dev
+    prometheus: kube-prometheus
+spec:
+  namespaceSelector:
+    matchNames:
+      - flink
+
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: de-platform
+
+  podMetricsEndpoints:
+    - targetPort: 9249
+      path: /metrics
+      interval: 60s      # Less frequent scraping in dev — reduces noise
+      scrapeTimeout: 10s
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod
+        - sourceLabels: [__meta_kubernetes_pod_namespace]
+          targetLabel: namespace
+        - sourceLabels: [__meta_kubernetes_pod_label_component]
+          targetLabel: flink_component
+        - sourceLabels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+          targetLabel: flink_job
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node

@@ -1,0 +1,393 @@
+# =============================================================================
+# JOB 2: CDC ENRICHMENT — FlinkDeployment + Python Script
+# =============================================================================
+# What it does:
+#   Source:  Kafka topic 'cdc.postgres-app-db' (Debezium CDC events)
+#            Consumer group: flink-cdc-enrichment-job (matches KEDA ScaledObject)
+#   Process: Flatten Debezium envelope, translate op codes, filter deletes,
+#            add processing metadata (processed_at, environment)
+#   Sink:    Kafka topic 'enriched.transactions' (upsert on transaction_id)
+#
+# Why process CDC in Flink instead of just using Debezium SMTs?
+#   • SMTs run in the Connect worker — adds CPU pressure during snapshot
+#   • Flink gives checkpointing + exactly-once guarantees
+#   • Flink allows joining CDC events with other streams (e.g., enriching with
+#     a user profile stream) — impossible with SMTs alone
+#   • This job is the foundation: add a join with user_profiles stream here later
+#
+# Debezium envelope (after ExtractNewRecordState SMT — already applied in connector):
+#   After the SMT, messages contain the flattened row + __op + __ts_ms fields.
+#   __op: c=insert, u=update, d=delete, r=snapshot read
+#
+# Scaling:
+#   parallelism: 4 → 2 TMs (4 slots ÷ 2 per TM)
+#   CDC topic has 60 partitions. 4 tasks = each task handles ~15 partitions.
+#   Scale to 60 (parallelism=60, 30 TMs) for full fan-out when needed.
+#
+# FUTURE additions to this job:
+#   1. Join with user_profiles stream (Kafka topic) for enrichment
+#   2. Add late event handling (transactions arriving > 5s after WAL commit)
+#   3. Emit DLQ records for malformed CDC events to a dead-letter topic
+# =============================================================================
+
+# ─── Python job script ────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cdc-enrichment-script
+  namespace: flink
+  labels:
+    app.kubernetes.io/name: cdc-enrichment
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+data:
+  cdc_enrichment.py: |
+    """
+    CDC Enrichment Processor — Flink Table API (PyFlink)
+
+    Reads Debezium CDC events from Kafka (post-SMT flattened format),
+    enriches with operation metadata, and writes to an output Kafka topic.
+
+    Consumer group: flink-cdc-enrichment-job
+    Source topic:   cdc.postgres-app-db
+    Sink topic:     enriched.transactions
+
+    Debezium flattened schema (after ExtractNewRecordState SMT):
+      transaction_id  STRING   — primary key from source table
+      user_id         STRING
+      amount          DECIMAL  — transaction amount
+      currency        STRING   — ISO 4217 (USD, EUR, INR...)
+      status          STRING   — PENDING / COMPLETED / FAILED
+      created_at      BIGINT   — epoch ms (source DB timestamp)
+      __op            STRING   — c=insert, u=update, d=delete, r=snapshot
+      __ts_ms         BIGINT   — Debezium WAL commit timestamp (epoch ms)
+
+    Enriched output schema:
+      transaction_id   STRING
+      user_id          STRING
+      amount           DECIMAL
+      currency         STRING
+      status           STRING
+      operation_type   STRING   — human-readable: INSERT / UPDATE / SNAPSHOT
+      source_ts        TIMESTAMP — when DB committed the transaction
+      processed_at     TIMESTAMP — when Flink processed it (wall clock)
+      environment      STRING   — prod / dev (injected from env var)
+    """
+
+    import os
+    import logging
+    from pyflink.table import EnvironmentSettings, TableEnvironment
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
+    log = logging.getLogger("cdc-enrichment")
+
+
+    def main():
+        settings = EnvironmentSettings.in_streaming_mode()
+        t_env = TableEnvironment.create(settings)
+
+        # ── Flink configuration ────────────────────────────────────────────────
+        cfg = t_env.get_config()
+        # CDC: shorter checkpoint interval — transactions need low latency
+        cfg.set("execution.checkpointing.interval", "30s")
+        cfg.set("execution.checkpointing.mode", "EXACTLY_ONCE")
+        cfg.set("state.backend", "rocksdb")
+        cfg.set("state.backend.incremental", "true")
+        cfg.set("state.backend.rocksdb.memory.managed", "true")
+        cfg.set(
+            "state.checkpoints.dir",
+            f"s3://{os.environ['FLINK_S3_BUCKET']}/checkpoints/cdc-enrichment",
+        )
+        cfg.set(
+            "state.savepoints.dir",
+            f"s3://{os.environ['FLINK_S3_BUCKET']}/savepoints/cdc-enrichment",
+        )
+        cfg.set("restart-strategy", "exponential-delay")
+        cfg.set("restart-strategy.exponential-delay.initial-backoff", "1s")
+        cfg.set("restart-strategy.exponential-delay.max-backoff", "5min")
+        cfg.set("restart-strategy.exponential-delay.multiplier", "2.0")
+
+        bootstrap = os.environ["KAFKA_BOOTSTRAP_SERVERS"]
+        username = os.environ["KAFKA_USERNAME"]
+        password = os.environ["KAFKA_PASSWORD"]
+        environment = os.environ.get("ENVIRONMENT", "prod")
+
+        sasl_jaas = (
+            "org.apache.kafka.common.security.scram.ScramLoginModule required "
+            f'username="{username}" password="{password}";'
+        )
+
+        kafka_security = f"""
+            'properties.security.protocol'       = 'SASL_SSL',
+            'properties.sasl.mechanism'           = 'SCRAM-SHA-512',
+            'properties.sasl.jaas.config'         = '{sasl_jaas}',
+            'properties.ssl.truststore.location'  = '/opt/flink/certs/kafka-ca.p12',
+            'properties.ssl.truststore.type'      = 'PKCS12',
+            'properties.ssl.truststore.password'  = 'changeit'
+        """
+
+        # ── Source table ───────────────────────────────────────────────────────
+        # scan.startup.mode = 'earliest-offset': CDC events must never be skipped.
+        # Flink checkpoints track the committed Kafka offset — on restart, it
+        # resumes from the last checkpointed offset, not earliest or latest.
+        # 'earliest-offset' only applies to the FIRST run (no checkpoint exists yet).
+        t_env.execute_sql(f"""
+            CREATE TABLE cdc_transactions (
+                transaction_id  STRING,
+                user_id         STRING,
+                amount          DECIMAL(18, 2),
+                currency        STRING,
+                status          STRING,
+                created_at      BIGINT,
+                __op            STRING,
+                __ts_ms         BIGINT,
+                -- event_time derived from Debezium WAL commit timestamp
+                event_time      AS TO_TIMESTAMP_LTZ(__ts_ms, 3),
+                -- Allow up to 5 seconds of late events (network + replication lag)
+                WATERMARK FOR event_time AS event_time - INTERVAL '5' SECOND
+            ) WITH (
+                'connector'                          = 'kafka',
+                'topic'                              = 'cdc.postgres-app-db',
+                'properties.bootstrap.servers'       = '{bootstrap}',
+                'properties.group.id'                = 'flink-cdc-enrichment-job',
+                {kafka_security},
+                'scan.startup.mode'                  = 'earliest-offset',
+                'format'                             = 'json',
+                'json.fail-on-missing-field'         = 'false',
+                'json.ignore-parse-errors'           = 'true'
+            )
+        """)
+
+        # ── Sink table ─────────────────────────────────────────────────────────
+        t_env.execute_sql(f"""
+            CREATE TABLE enriched_transactions (
+                transaction_id   STRING,
+                user_id          STRING,
+                amount           DECIMAL(18, 2),
+                currency         STRING,
+                status           STRING,
+                operation_type   STRING,
+                source_ts        TIMESTAMP(3),
+                processed_at     TIMESTAMP(3),
+                environment      STRING,
+                PRIMARY KEY (transaction_id) NOT ENFORCED
+            ) WITH (
+                'connector'                          = 'upsert-kafka',
+                'topic'                              = 'enriched.transactions',
+                'properties.bootstrap.servers'       = '{bootstrap}',
+                {kafka_security},
+                'key.format'                         = 'json',
+                'value.format'                       = 'json'
+            )
+        """)
+
+        log.info("Tables defined. Starting CDC enrichment job.")
+
+        # ── Streaming query ────────────────────────────────────────────────────
+        # CASE __op: translate Debezium op codes to human-readable strings.
+        # Filter: WHERE __op IN ('c','u','r') — exclude deletes.
+        #   Deletes are excluded here because the enriched.transactions topic is
+        #   used by downstream consumers that maintain a current state view (upsert).
+        #   If you need a delete event stream, add a separate sink with WHERE __op='d'.
+        # NOW(): Flink processing time (wall clock when the record is processed).
+        stmt = t_env.create_statement_set()
+        stmt.add_insert_sql(f"""
+            INSERT INTO enriched_transactions
+            SELECT
+                transaction_id,
+                user_id,
+                amount,
+                currency,
+                status,
+                CASE __op
+                    WHEN 'c' THEN 'INSERT'
+                    WHEN 'u' THEN 'UPDATE'
+                    WHEN 'r' THEN 'SNAPSHOT'
+                    ELSE 'UNKNOWN'
+                END                   AS operation_type,
+                event_time            AS source_ts,
+                NOW()                 AS processed_at,
+                '{environment}'       AS environment
+            FROM cdc_transactions
+            WHERE __op IN ('c', 'u', 'r')
+        """)
+
+        stmt.execute().wait()
+
+
+    if __name__ == "__main__":
+        main()
+
+---
+# ─── FlinkDeployment ──────────────────────────────────────────────────────────
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: cdc-enrichment
+  namespace: flink
+  labels:
+    app.kubernetes.io/name: cdc-enrichment
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+spec:
+  image: 123456789012.dkr.ecr.ap-south-1.amazonaws.com/flink-platform:1.18.1  # PLACEHOLDER
+  imagePullPolicy: Always
+  flinkVersion: v1_18
+  serviceAccount: flink-sa
+
+  flinkConfiguration:
+    taskmanager.numberOfTaskSlots: "2"
+    state.backend: rocksdb
+    state.backend.incremental: "true"
+    state.backend.rocksdb.memory.managed: "true"
+    state.checkpoints.dir: s3://de-platform-prod-flink/checkpoints/cdc-enrichment  # PLACEHOLDER bucket
+    state.savepoints.dir: s3://de-platform-prod-flink/savepoints/cdc-enrichment
+    execution.checkpointing.interval: "30000"    # 30s — CDC needs lower latency than clickstream
+    execution.checkpointing.mode: EXACTLY_ONCE
+    execution.checkpointing.timeout: "120000"    # 2min (CDC state is smaller than clickstream)
+    execution.checkpointing.min-pause: "15000"
+    execution.checkpointing.max-concurrent-checkpoints: "1"
+    restart-strategy: exponential-delay
+    restart-strategy.exponential-delay.initial-backoff: 1s
+    restart-strategy.exponential-delay.max-backoff: 5min
+    restart-strategy.exponential-delay.multiplier: "2.0"
+    metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+    metrics.reporter.prom.port: "9249"
+    s3.access-key: ""
+    s3.secret-key: ""
+    fs.s3a.aws.credentials.provider: com.amazonaws.auth.WebIdentityTokenCredentialsProvider
+
+  podTemplate:
+    spec:
+      serviceAccountName: flink-sa
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: flink
+          effect: NoSchedule
+      initContainers:
+        - name: cert-converter
+          image: eclipse-temurin:11-jre-alpine
+          command:
+            - sh
+            - -c
+            - |
+              keytool -importcert -trustcacerts -noprompt \
+                -alias kafka-ca \
+                -file /certs-src/ca.crt \
+                -keystore /opt/flink/certs/kafka-ca.p12 \
+                -storetype PKCS12 \
+                -storepass changeit
+          volumeMounts:
+            - name: kafka-ca-cert
+              mountPath: /certs-src
+              readOnly: true
+            - name: flink-certs
+              mountPath: /opt/flink/certs
+      volumes:
+        - name: cdc-script
+          configMap:
+            name: cdc-enrichment-script
+        - name: kafka-ca-cert
+          secret:
+            secretName: de-kafka-cluster-cluster-ca-cert
+        - name: flink-certs
+          emptyDir: {}
+
+  jobManager:
+    resource:
+      memory: "2048m"
+      cpu: 1
+    podTemplate:
+      spec:
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: role
+                      operator: In
+                      values:
+                        - flink
+        env:
+          - name: KAFKA_USERNAME
+            valueFrom:
+              secretKeyRef:
+                name: flink-processor
+                key: user
+          - name: KAFKA_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: flink-processor
+                key: password
+          - name: KAFKA_BOOTSTRAP_SERVERS
+            value: "de-kafka-cluster-kafka-tls-bootstrap.kafka.svc:9093"
+          - name: FLINK_S3_BUCKET
+            value: "de-platform-prod-flink"
+          - name: ENVIRONMENT
+            value: "prod"
+        volumeMounts:
+          - name: cdc-script
+            mountPath: /opt/flink/scripts
+          - name: flink-certs
+            mountPath: /opt/flink/certs
+
+  taskManager:
+    resource:
+      memory: "10240m"
+      cpu: 1
+    podTemplate:
+      spec:
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: role
+                      operator: In
+                      values:
+                        - flink
+        containers:
+          - name: flink-main-container
+            resources:
+              requests:
+                memory: "10Gi"
+                cpu: "1"
+              limits:
+                memory: "14Gi"
+                cpu: "2"
+        env:
+          - name: KAFKA_USERNAME
+            valueFrom:
+              secretKeyRef:
+                name: flink-processor
+                key: user
+          - name: KAFKA_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: flink-processor
+                key: password
+          - name: KAFKA_BOOTSTRAP_SERVERS
+            value: "de-kafka-cluster-kafka-tls-bootstrap.kafka.svc:9093"
+          - name: FLINK_S3_BUCKET
+            value: "de-platform-prod-flink"
+          - name: ENVIRONMENT
+            value: "prod"
+        volumeMounts:
+          - name: cdc-script
+            mountPath: /opt/flink/scripts
+          - name: flink-certs
+            mountPath: /opt/flink/certs
+
+  job:
+    jarURI: local:///opt/flink/opt/flink-python_2.12-1.18.1.jar
+    entryClass: org.apache.flink.client.python.PythonDriver
+    args:
+      - "-py"
+      - "/opt/flink/scripts/cdc_enrichment.py"
+    parallelism: 4          # 4 tasks → 2 TMs. CDC topic: 60 partitions, each TM handles 30.
+    upgradeMode: savepoint
+    state: running

@@ -1,0 +1,60 @@
+# =============================================================================
+# KEDA SCALED OBJECTS — DEV (smaller scale ranges)
+# =============================================================================
+# Same structure as prod but:
+#   minReplicaCount: 0 or 1 (scale from near-zero in dev)
+#   maxReplicaCount: 10 (dev traffic is low)
+#   lagThreshold: same (validates same logic)
+#   cooldownPeriod: shorter (faster feedback during dev testing)
+# =============================================================================
+
+# ─── Flink TaskManager Scaler — Clickstream (Dev) ─────────────────────────────
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: flink-tm-clickstream-scaler
+  namespace: flink
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: dev
+spec:
+  scaleTargetRef:
+    name: flink-taskmanager
+    kind: Deployment
+  pollingInterval: 15
+  cooldownPeriod: 60                     # Short cooldown in dev (faster iteration)
+  minReplicaCount: 0                     # Scale to 0 in dev when no traffic
+  maxReplicaCount: 10                    # Max 10 for dev traffic
+
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: de-kafka-cluster-kafka-tls-bootstrap.kafka.svc:9093
+        consumerGroup: flink-clickstream-job
+        topic: app.clickstream.events
+        lagThreshold: "100"              # Tighter threshold in dev (less traffic)
+        activationLagThreshold: "5"
+        offsetResetPolicy: latest
+      authenticationRef:
+        name: kafka-trigger-auth-flink
+
+---
+# ─── TriggerAuthentication — Dev ─────────────────────────────────────────────
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: kafka-trigger-auth-flink
+  namespace: flink
+  labels:
+    environment: dev
+spec:
+  secretTargetRef:
+    - parameter: username
+      name: flink-processor
+      key: user
+    - parameter: password
+      name: flink-processor
+      key: password
+    - parameter: ca
+      name: de-kafka-cluster-cluster-ca-cert
+      key: ca.crt

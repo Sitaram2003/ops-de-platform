@@ -1,0 +1,162 @@
+# =============================================================================
+# SPARK OPERATOR — ArgoCD Application (Prod + Dev)
+# =============================================================================
+# spark-on-k8s-operator v1.1.27 manages SparkApplication and
+# ScheduledSparkApplication CRs. Install BEFORE applying any SparkApplication.
+#
+# ArgoCD sync-wave: -5 (after namespaces -10, before Spark jobs 0)
+#
+# What the operator does:
+#   • Watches SparkApplication + ScheduledSparkApplication CRs
+#   • Creates driver + executor pods for each run
+#   • Handles restartPolicy / retry logic (OnFailure, Never, Always)
+#   • Exposes Prometheus metrics (operator pod on :8080, Spark app on :4040)
+#   • Admission webhook validates SparkApplication specs at apply time
+#
+# Helm repo: https://googlecloudplatform.github.io/spark-on-k8s-operator
+# =============================================================================
+
+# ─── Prod ─────────────────────────────────────────────────────────────────────
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: spark-operator-prod
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    component: spark-operator
+    environment: prod
+  annotations:
+    argocd.argoproj.io/sync-wave: "-5"   # After namespaces (-10), before Spark jobs (0)
+spec:
+  project: de-platform
+  source:
+    repoURL: https://googlecloudplatform.github.io/spark-on-k8s-operator
+    chart: spark-operator
+    targetRevision: 1.1.27
+
+    helm:
+      values: |
+        # Operator pod resources — runs on operators-ng node group
+        resources:
+          requests:
+            memory: 256Mi
+            cpu: "0.1"
+          limits:
+            memory: 512Mi
+            cpu: "0.5"
+
+        # Land on operators-ng — does NOT compete with Spark executor pods
+        tolerations:
+          - key: dedicated
+            operator: Equal
+            value: operators
+            effect: NoSchedule
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: role
+                      operator: In
+                      values:
+                        - operators
+
+        # Only watch the spark namespace (least-privilege)
+        sparkJobNamespace: spark
+
+        # Admission webhook — validates SparkApplication specs at kubectl apply time.
+        # Catches missing serviceAccount, invalid resource requests, etc.
+        webhook:
+          enable: true
+          port: 8080
+
+        # Prometheus metrics from operator pod
+        metrics:
+          enable: true
+          port: 10254
+          portName: metrics
+          endpoint: /metrics
+
+        # Batch scheduler (Volcano) not used — Cluster Autoscaler + SPOT handles scaling
+        batchScheduler:
+          enable: false
+
+        # ServiceAccount the operator uses to manage Spark pods
+        serviceAccounts:
+          spark:
+            create: true
+            name: spark-operator
+          sparkoperator:
+            create: true
+            name: spark-operator
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: spark
+
+  syncPolicy:
+    automated:
+      prune: false    # Never auto-prune operator — would delete running SparkApplications
+      selfHeal: false
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+
+---
+# ─── Dev ──────────────────────────────────────────────────────────────────────
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: spark-operator-dev
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    component: spark-operator
+    environment: dev
+  annotations:
+    argocd.argoproj.io/sync-wave: "-5"
+spec:
+  project: de-platform
+  source:
+    repoURL: https://googlecloudplatform.github.io/spark-on-k8s-operator
+    chart: spark-operator
+    targetRevision: 1.1.27
+
+    helm:
+      values: |
+        resources:
+          requests:
+            memory: 128Mi
+            cpu: "0.1"
+          limits:
+            memory: 256Mi
+            cpu: "0.3"
+        tolerations:
+          - key: dedicated
+            operator: Equal
+            value: operators
+            effect: NoSchedule
+        sparkJobNamespace: spark
+        webhook:
+          enable: true
+          port: 8080
+        metrics:
+          enable: true
+          port: 10254
+          portName: metrics
+          endpoint: /metrics
+        batchScheduler:
+          enable: false
+
+  destination:
+    server: https://kubernetes.default.svc   # PLACEHOLDER: dev cluster API endpoint
+    namespace: spark
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

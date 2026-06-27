@@ -1,0 +1,167 @@
+# =============================================================================
+# DEV KAFKA USERS — Same structure as prod, dev cluster only
+# =============================================================================
+# Dev users are identical to prod — ensures the exact same config is validated
+# before promoting to prod. The credentials are different (dev Secrets Manager
+# paths), but the ACL structure is the same.
+# =============================================================================
+
+# ─── 1. CLICKSTREAM PRODUCER ─────────────────────────────────────────────────
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: clickstream-producer
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: de-kafka-cluster
+    environment: dev
+spec:
+  authentication:
+    type: scram-sha-512
+  authorization:
+    type: simple
+    acls:
+      - resource:
+          type: topic
+          name: app.clickstream.events
+          patternType: literal
+        operations:
+          - Write
+          - Describe
+        host: "*"
+      - resource:
+          type: transactionalId
+          name: clickstream-txn-
+          patternType: prefix
+        operations:
+          - Write
+        host: "*"
+
+---
+# ─── 2. FLINK PROCESSOR ──────────────────────────────────────────────────────
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: flink-processor
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: de-kafka-cluster
+    environment: dev
+spec:
+  authentication:
+    type: scram-sha-512
+  authorization:
+    type: simple
+    acls:
+      - resource:
+          type: topic
+          name: app.
+          patternType: prefix
+        operations:
+          - Read
+          - Describe
+        host: "*"
+      - resource:
+          type: topic
+          name: cdc.
+          patternType: prefix
+        operations:
+          - Read
+          - Describe
+        host: "*"
+      - resource:
+          type: group
+          name: flink-
+          patternType: prefix
+        operations:
+          - Read
+          - Describe
+        host: "*"
+      - resource:
+          type: topic
+          name: processed.
+          patternType: prefix
+        operations:
+          - Write
+          - Describe
+          - Create
+        host: "*"
+      - resource:
+          type: transactionalId
+          name: flink-
+          patternType: prefix
+        operations:
+          - Write
+          - Describe
+        host: "*"
+
+---
+# ─── 3. KAFKA CONNECT ────────────────────────────────────────────────────────
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: kafka-connect-user
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: de-kafka-cluster
+    environment: dev
+spec:
+  authentication:
+    type: scram-sha-512
+  authorization:
+    type: simple
+    acls:
+      - resource:
+          type: topic
+          name: "*"
+          patternType: literal
+        operations:
+          - Read
+          - Write
+          - Describe
+          - Create
+        host: "*"
+      - resource:
+          type: group
+          name: connect-
+          patternType: prefix
+        operations:
+          - Read
+          - Write
+          - Describe
+        host: "*"
+
+---
+# ─── 4. SCHEMA REGISTRY ──────────────────────────────────────────────────────
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: schema-registry-user
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: de-kafka-cluster
+    environment: dev
+spec:
+  authentication:
+    type: scram-sha-512
+  authorization:
+    type: simple
+    acls:
+      - resource:
+          type: topic
+          name: _schemas
+          patternType: literal
+        operations:
+          - Read
+          - Write
+          - Describe
+          - Create
+        host: "*"
+      - resource:
+          type: group
+          name: schema-registry-
+          patternType: prefix
+        operations:
+          - Read
+          - Describe
+        host: "*"

@@ -1,0 +1,110 @@
+# =============================================================================
+# ARGOCD APPLICATION SET — Spark Batch Component (Prod + Dev + Staging)
+# =============================================================================
+# Mirrors kafka-applicationset.yaml. Generates three ArgoCD Applications:
+#   - prod-spark:    watches environments/prod/spark-infra/ on 'main'  (manual sync)
+#   - staging-spark: watches environments/staging/spark-infra/ on 'main' (manual sync)
+#   - dev-spark:     watches environments/dev/spark-infra/  on 'develop' (auto-sync)
+#
+# Deploy:
+#   kubectl apply -f argocd/applicationsets/spark-applicationset.yaml -n argocd
+# =============================================================================
+
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: spark-platform
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    component: spark
+spec:
+  generators:
+    - list:
+        elements:
+          # ─── Production Spark ─────────────────────────────────────────────
+          - env: prod
+            cluster: https://kubernetes.default.svc
+            branch: main
+            path: environments/prod/spark-infra
+            auto_sync: "false"   # Manual deploy for prod
+            prune: "false"
+            self_heal: "false"
+
+          # ─── Staging Spark ────────────────────────────────────────────────
+          - env: staging
+            cluster: https://kubernetes.default.svc    # PLACEHOLDER: staging cluster endpoint
+            branch: main
+            path: environments/staging/spark-infra
+            auto_sync: "false"   # Manual sync for staging
+            prune: "false"
+            self_heal: "false"
+
+          # ─── Development Spark ────────────────────────────────────────────
+          - env: dev
+            cluster: https://kubernetes.default.svc
+            branch: develop
+            path: environments/dev/spark-infra
+            auto_sync: "true"
+            prune: "true"
+            self_heal: "true"
+
+  template:
+    metadata:
+      name: "{{env}}-spark"
+      namespace: argocd
+      labels:
+        app.kubernetes.io/part-of: de-platform
+        component: spark
+        environment: "{{env}}"
+      annotations:
+        notifications.argoproj.io/subscribe.on-sync-failed.slack: "de-alerts-{{env}}"
+        notifications.argoproj.io/subscribe.on-sync-succeeded.slack: "de-platform-info"
+
+    spec:
+      project: de-platform
+
+      source:
+        repoURL: "https://github.com/<ORG>/de-platform.git"  # PLACEHOLDER
+        targetRevision: "{{branch}}"
+        path: "{{path}}"
+        directory:
+          recurse: true
+          exclude: "{*.md,**/helm/**,**/docs/**}"
+
+      destination:
+        server: "{{cluster}}"
+        namespace: spark    # Default namespace; each YAML declares its own namespace
+
+      syncPolicy:
+        automated:
+          prune: "{{prune}}"
+          selfHeal: "{{self_heal}}"
+          allowEmpty: false
+        syncOptions:
+          - CreateNamespace=true
+          - PruneLast=true
+          - ApplyOutOfSyncOnly=true
+          - ServerSideApply=true
+          - RespectIgnoreDifferences=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m
+
+      ignoreDifferences:
+        - group: sparkoperator.k8s.io
+          kind: SparkApplication
+          jsonPointers:
+            - /status
+        - group: sparkoperator.k8s.io
+          kind: ScheduledSparkApplication
+          jsonPointers:
+            - /status
+            - /spec/template/spec/executor/instances
+        - group: ""
+          kind: Secret
+          jsonPointers:
+            - /data

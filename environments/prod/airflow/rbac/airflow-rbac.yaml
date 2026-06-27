@@ -1,0 +1,123 @@
+# =============================================================================
+# AIRFLOW RBAC — ServiceAccount + Roles (Prod)
+# =============================================================================
+# airflow-sa (in airflow namespace) needs two sets of permissions:
+#
+#   1. airflow namespace — KubernetesExecutor creates/deletes task pods here
+#   2. spark namespace   — task pods create SparkApplication CRs to trigger jobs
+#
+# IRSA: AirflowRole-Prod grants s3:PutObject/GetObject on the airflow-logs
+# S3 prefix (remote logging destination configured in airflow-app.yaml).
+#
+# Note: Airflow → Kubernetes API Server calls are NOT affected by NetworkPolicy
+# (they go via the API server endpoint, not pod-to-pod). The RoleBinding in
+# the spark namespace is sufficient for SparkApplication CR creation.
+# =============================================================================
+
+# ─── ServiceAccount ───────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: airflow-sa
+  namespace: airflow
+  labels:
+    app.kubernetes.io/name: airflow-sa
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+  annotations:
+    # IRSA: grants S3 access for remote task log shipping
+    eks.amazonaws.com/role-arn: "arn:aws:iam::123456789012:role/AirflowRole-Prod"
+    eks.amazonaws.com/token-expiration: "86400"   # 24h token rotation
+
+---
+# ─── Role: airflow namespace ─────────────────────────────────────────────────
+# KubernetesExecutor creates an ephemeral pod per task, waits for completion,
+# then deletes it. The scheduler + webserver also need to read configmaps and
+# secrets for DAG variables and connections.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: airflow-worker-role
+  namespace: airflow
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+rules:
+  # KubernetesExecutor lifecycle: create task pod → watch until done → delete
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch, create, delete, patch]
+  - apiGroups: [""]
+    resources: [pods/log]
+    verbs: [get, list]
+  # Airflow variables, connections, and XCom values stored in configmaps/secrets
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, list]
+  # Events for debugging task pod failures
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [get, list, watch]
+
+---
+# ─── RoleBinding: airflow namespace ──────────────────────────────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: airflow-worker-rolebinding
+  namespace: airflow
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+subjects:
+  - kind: ServiceAccount
+    name: airflow-sa
+    namespace: airflow
+roleRef:
+  kind: Role
+  name: airflow-worker-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ─── Role: spark namespace ────────────────────────────────────────────────────
+# Airflow task pods (running in the airflow namespace with airflow-sa) need to
+# create and monitor SparkApplication CRs in the spark namespace.
+# This Role lives in the spark namespace; the RoleBinding below grants it to
+# airflow-sa from the airflow namespace (cross-namespace binding).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: airflow-spark-submitter
+  namespace: spark
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+rules:
+  - apiGroups: ["sparkoperator.k8s.io"]
+    resources: [sparkapplications]
+    verbs: [create, get, list, watch, delete, patch]
+
+---
+# ─── RoleBinding: spark namespace → airflow-sa ───────────────────────────────
+# Cross-namespace: binds the spark Role to the ServiceAccount in airflow namespace.
+# This is the standard K8s pattern for cross-namespace access.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: airflow-spark-submitter-rolebinding
+  namespace: spark
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+subjects:
+  - kind: ServiceAccount
+    name: airflow-sa
+    namespace: airflow    # SA is in airflow ns; binding is in spark ns
+roleRef:
+  kind: Role
+  name: airflow-spark-submitter
+  apiGroup: rbac.authorization.k8s.io
+</content>

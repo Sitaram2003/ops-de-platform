@@ -1,0 +1,126 @@
+# =============================================================================
+# SPARK ALERT RULES — PrometheusRule (Prod)
+# =============================================================================
+# Alert flow: same routing as Kafka/Flink — critical → PagerDuty, warning → Slack
+#
+# Spark job state machine (spark-on-k8s-operator):
+#   SUBMITTED → RUNNING → SUCCEEDING → COMPLETED (happy path)
+#   SUBMITTED → RUNNING → FAILING → FAILED        (failure path — retries exhausted)
+#
+# The spark_app_count metric reports current counts per state.
+# When a job is FAILED, it stays in FAILED state until manually deleted or a new
+# run is submitted (ScheduledSparkApplication auto-submits on next cron trigger).
+#
+# Job timing (configured in ScheduledSparkApplication):
+#   DQ report:            cron 0 19 * * * — expected ~20min runtime
+#   Clickstream agg:      cron 30 20 * * * — expected ~45min runtime
+#   Transaction analytics: cron 30 21 * * * — expected ~45min runtime
+# =============================================================================
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: spark-alert-rules
+  namespace: monitoring
+  labels:
+    prometheus: kube-prometheus
+    role: alert-rules
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+spec:
+  groups:
+
+    # ─── CRITICAL: Job Failures ───────────────────────────────────────────────
+    - name: spark.critical.failures
+      interval: 30s
+      rules:
+
+        # A Spark job is in FAILED state (retries exhausted).
+        # ScheduledSparkApplication will retry on next cron trigger (next day).
+        # On-call must investigate why the job failed before the next scheduled run.
+        - alert: SparkJobFailed
+          expr: spark_app_count{state="FAILED"} > 0
+          for: 5m   # Wait 5min — transient FAILED state during operator restart is normal
+          labels:
+            severity: critical
+            team: data-engineering
+            service: spark
+          annotations:
+            summary: "{{ $value }} Spark job(s) in FAILED state in namespace {{ $labels.namespace }}"
+            description: |
+              One or more Spark jobs have failed (retries exhausted).
+              Check which jobs: kubectl get sparkapplication -n spark
+              View driver logs: kubectl logs -n spark -l spark-role=driver --tail=100
+              The ScheduledSparkApplication will auto-retry on next cron trigger.
+              If the failure is data-related (bad S3 path, DQ failure), fix the
+              root cause before the next scheduled run.
+            runbook: "https://wiki.internal/runbooks/spark/job-failed"
+
+    # ─── WARNING: Job Health ──────────────────────────────────────────────────
+    - name: spark.warning.health
+      interval: 30s
+      rules:
+
+        # Job running longer than 2 hours (4× expected runtime).
+        # Likely cause: stuck executor, shuffle spill to disk (insufficient memory),
+        # or Snowflake connector staging timeout.
+        # Note: spark_app_submit_time is seconds since epoch.
+        - alert: SparkJobRunningTooLong
+          expr: |
+            (spark_app_count{state="RUNNING"} > 0)
+            and on (namespace)
+            (time() - spark_app_submit_time > 7200)
+          for: 0m
+          labels:
+            severity: warning
+            team: data-engineering
+            service: spark
+          annotations:
+            summary: "Spark job in namespace {{ $labels.namespace }} has been running > 2 hours"
+            description: |
+              A Spark job has been in RUNNING state for more than 2 hours.
+              Expected runtime: ~45 minutes for analytics jobs, ~20 minutes for DQ report.
+              Possible causes:
+                1. Executor memory too low → spilling to disk (GC pressure)
+                2. Snowflake write staging timeout (check IRSA role S3 permissions)
+                3. S3 read throttling (check AWS CloudWatch for ThrottlingExceptions)
+              Check: kubectl logs -n spark -l spark-role=driver
+            runbook: "https://wiki.internal/runbooks/spark/job-running-too-long"
+
+        # Operator not emitting metrics — operator pod may have crashed.
+        # If operator is down, ScheduledSparkApplications will not be submitted.
+        - alert: SparkOperatorDown
+          expr: absent(spark_app_count)
+          for: 5m
+          labels:
+            severity: warning
+            team: data-engineering
+            service: spark
+          annotations:
+            summary: "spark-on-k8s-operator is not emitting metrics"
+            description: |
+              The spark_app_count metric has been absent for 5+ minutes.
+              The spark-on-k8s-operator pod may be down — check:
+                kubectl get pods -n spark -l app.kubernetes.io/name=spark-operator
+              If the pod is in CrashLoopBackOff, check:
+                kubectl logs -n spark -l app.kubernetes.io/name=spark-operator
+            runbook: "https://wiki.internal/runbooks/spark/operator-down"
+
+        # High executor failure rate — executors dying repeatedly.
+        # Likely OOM, bad node, or driver lost contact.
+        - alert: SparkExecutorFailureHigh
+          expr: spark_app_executor_count{state="FAILED"} > 5
+          for: 10m
+          labels:
+            severity: warning
+            team: data-engineering
+            service: spark
+          annotations:
+            summary: "{{ $value }} Spark executors in FAILED state"
+            description: |
+              More than 5 executor pods are in FAILED state.
+              Possible causes: OOMKilled (increase executor memory/memoryOverhead),
+              SPOT eviction (normal on Spot nodes — operator retries),
+              or persistent disk I/O errors on the spark-ng node.
+              Check: kubectl get pods -n spark | grep executor
+            runbook: "https://wiki.internal/runbooks/spark/executor-failures"

@@ -1,0 +1,109 @@
+# =============================================================================
+# ARGOCD APPLICATION SET — Airflow Orchestration (Prod + Dev + Staging)
+# =============================================================================
+# Generates three ArgoCD Applications:
+#   - prod-airflow:    watches environments/prod/airflow/ on 'main'  (manual sync)
+#   - staging-airflow: watches environments/staging/airflow/ on 'main' (manual sync)
+#   - dev-airflow:     watches environments/dev/airflow/  on 'develop' (auto-sync)
+#
+# Deploy:
+#   kubectl apply -f argocd/applicationsets/airflow-applicationset.yaml -n argocd
+# =============================================================================
+
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: airflow-platform
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    component: airflow
+spec:
+  generators:
+    - list:
+        elements:
+          # ─── Production Airflow ───────────────────────────────────────────
+          - env: prod
+            cluster: https://kubernetes.default.svc
+            branch: main
+            path: environments/prod/airflow
+            auto_sync: "false"   # Manual deploy for prod
+            prune: "false"
+            self_heal: "false"
+
+          # ─── Staging Airflow ──────────────────────────────────────────────
+          - env: staging
+            cluster: https://kubernetes.default.svc    # PLACEHOLDER: staging cluster endpoint
+            branch: main
+            path: environments/staging/airflow
+            auto_sync: "false"   # Manual sync for staging
+            prune: "false"
+            self_heal: "false"
+
+          # ─── Development Airflow ──────────────────────────────────────────
+          - env: dev
+            cluster: https://kubernetes.default.svc
+            branch: develop
+            path: environments/dev/airflow
+            auto_sync: "true"
+            prune: "true"
+            self_heal: "true"
+
+  template:
+    metadata:
+      name: "{{env}}-airflow"
+      namespace: argocd
+      labels:
+        app.kubernetes.io/part-of: de-platform
+        component: airflow
+        environment: "{{env}}"
+      annotations:
+        notifications.argoproj.io/subscribe.on-sync-failed.slack: "de-alerts-{{env}}"
+        notifications.argoproj.io/subscribe.on-sync-succeeded.slack: "de-platform-info"
+
+    spec:
+      project: de-platform
+
+      source:
+        repoURL: "https://github.com/<ORG>/de-platform.git"  # PLACEHOLDER
+        targetRevision: "{{branch}}"
+        path: "{{path}}"
+        directory:
+          recurse: true
+          exclude: "{*.md,**/helm/**,**/docs/**}"
+
+      destination:
+        server: "{{cluster}}"
+        namespace: airflow    # Default namespace; each YAML declares its own namespace
+
+      syncPolicy:
+        automated:
+          prune: "{{prune}}"
+          selfHeal: "{{self_heal}}"
+          allowEmpty: false
+        syncOptions:
+          - CreateNamespace=true
+          - PruneLast=true
+          - ApplyOutOfSyncOnly=true
+          - ServerSideApply=true
+          - RespectIgnoreDifferences=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m
+
+      ignoreDifferences:
+        - group: apps
+          kind: Deployment
+          jsonPointers:
+            - /spec/replicas
+        - group: apps
+          kind: StatefulSet
+          jsonPointers:
+            - /spec/replicas
+        - group: ""
+          kind: Secret
+          jsonPointers:
+            - /data

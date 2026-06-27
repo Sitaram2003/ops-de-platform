@@ -1,0 +1,131 @@
+# =============================================================================
+# DEV KAFKA CLUSTER CR — Strimzi KRaft Mode
+# =============================================================================
+# Dev cluster mirrors prod topology but at minimal scale.
+# Key differences from prod:
+#   • 1 broker (vs 3-12 in prod) — no HA, acceptable for development
+#   • 1 controller (vs 3 in prod) — Raft quorum with 1 node is technically valid
+#     but has no fault tolerance. Acceptable for dev.
+#   • No tiered storage — dev data is ephemeral, S3 cost not justified
+#   • Reduced retention (2 days vs 7 days in prod) — saves EBS storage costs
+#   • RF=1 for all topics in dev — saves EBS (no 3x replication overhead)
+#   • No CruiseControl — no need to rebalance a single-broker cluster
+#   • Relaxed quotas — dev engineers need to test high-throughput scenarios
+# =============================================================================
+
+apiVersion: kafka.strimzi.io/v1beta2
+kind: Kafka
+metadata:
+  name: de-kafka-cluster            # Same name as prod — configs are portable
+  namespace: kafka
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: dev
+  annotations:
+    strimzi.io/node-pools: enabled
+    strimzi.io/kraft: enabled
+
+spec:
+  kafka:
+    version: 3.7.0
+    metadataVersion: 3.7-IV4
+
+    listeners:
+      # Internal listener — same as prod (in-cluster traffic)
+      - name: tls
+        port: 9093
+        type: internal
+        tls: true
+        authentication:
+          type: scram-sha-512
+
+      # External listener — NLB for dev tooling (Kafka UI, external test producers)
+      - name: external
+        port: 9094
+        type: loadbalancer
+        tls: true
+        authentication:
+          type: scram-sha-512
+        configuration:
+          bootstrap:
+            annotations:
+              service.beta.kubernetes.io/aws-load-balancer-type: nlb
+              service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+
+    authorization:
+      type: simple
+      superUsers:
+        - User:kafka-admin
+        - User:strimzi-kafka-user
+
+    config:
+      # Dev replication: RF=1 (single broker) — no min.isr needed
+      offsets.topic.replication.factor: 1
+      transaction.state.log.replication.factor: 1
+      transaction.state.log.min.isr: 1
+      default.replication.factor: 1
+      min.insync.replicas: 1         # Single replica is "in sync" with itself
+
+      socket.send.buffer.bytes: 102400
+      socket.receive.buffer.bytes: 102400
+      socket.request.max.bytes: 104857600
+
+      # Dev retention: 2 days (vs 7 in prod) — reduces EBS cost significantly
+      log.retention.hours: 48
+      log.segment.bytes: 536870912  # 512MB segments (half of prod — faster rotation for dev)
+      log.retention.check.interval.ms: 300000
+
+      # Dev thread count — scaled to r5.xlarge (4 vCPU)
+      num.io.threads: 8
+      num.network.threads: 4
+
+      compression.type: lz4
+
+      # NO tiered storage in dev — cost not justified for dev data volumes
+      # To test tiered storage behavior, use a dedicated staging environment
+
+      auto.create.topics.enable: "false"
+      delete.topic.enable: "true"
+      group.initial.rebalance.delay.ms: 1000   # Shorter in dev (faster test iteration)
+
+      broker.rack: "${STRIMZI_RACK_ID}"
+
+    rack:
+      topologyKey: topology.kubernetes.io/zone
+
+    metricsConfig:
+      type: jmxPrometheusExporter
+      valueFrom:
+        configMapKeyRef:
+          name: kafka-jmx-exporter-config
+          key: kafka-metrics-config.yml
+
+    readinessProbe:
+      initialDelaySeconds: 20
+      timeoutSeconds: 5
+
+    livenessProbe:
+      initialDelaySeconds: 45
+      timeoutSeconds: 5
+
+  entityOperator:
+    topicOperator:
+      resources:
+        requests:
+          memory: 256Mi
+          cpu: "0.1"
+        limits:
+          memory: 512Mi
+          cpu: "0.3"
+      reconciliationIntervalSeconds: 60
+    userOperator:
+      resources:
+        requests:
+          memory: 256Mi
+          cpu: "0.1"
+        limits:
+          memory: 512Mi
+          cpu: "0.3"
+      reconciliationIntervalSeconds: 60
+
+  # No CruiseControl in dev — single broker doesn't need partition rebalancing

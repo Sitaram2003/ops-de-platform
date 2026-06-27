@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spark-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+    environment: prod
+data:
+  spark-dashboard.json: |
+    {"title": "Spark Overview", "uid": "spark-overview", "panels": []}

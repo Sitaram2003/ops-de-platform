@@ -1,0 +1,245 @@
+# =============================================================================
+# PROD KAFKA CONNECT CLUSTER
+# =============================================================================
+# Distributed Kafka Connect cluster — 3 worker pods.
+# Workers coordinate via internal Kafka topics (connect-configs, connect-offsets,
+# connect-status). If one worker crashes, its tasks are rebalanced to surviving workers.
+#
+# KEY ENHANCEMENT from existing config: ESO secret injection via externalConfiguration.
+#
+# Credential flow:
+#   AWS Secrets Manager
+#     → ESO ExternalSecret (external-secrets/kafka-connector-secrets.yaml)
+#       → K8s Secret 'postgres-cdc-credentials' in kafka-connect namespace
+#         → KafkaConnect externalConfiguration.env mounts keys as env vars
+#           → Connector config references ${env:POSTGRES_DB_HOSTNAME} etc.
+#
+# This means: rotate DB password in Secrets Manager → ESO syncs K8s Secret
+# within 1 hour → restart connector task → zero YAML changes required.
+# =============================================================================
+
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaConnect
+metadata:
+  name: de-connect-cluster
+  namespace: kafka-connect
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+  annotations:
+    # Enables KafkaConnector CRs — instead of POST /connectors REST API manually,
+    # apply a KafkaConnector YAML → Strimzi calls the Connect REST API for you
+    strimzi.io/use-connector-resources: "true"
+
+spec:
+  version: 3.7.0
+  replicas: 3                        # 3 workers: 1 node per worker (anti-affinity)
+
+  # Bootstrap to internal TLS listener
+  bootstrapServers: de-kafka-cluster-kafka-tls-bootstrap.kafka:9093
+
+  # TLS: mount Strimzi-generated cluster CA cert for TLS verification
+  tls:
+    trustedCertificates:
+      - secretName: de-kafka-cluster-cluster-ca-cert
+        certificate: ca.crt
+
+  # Authentication: Connect cluster authenticates as 'kafka-connect-user'
+  authentication:
+    type: scram-sha-512
+    username: kafka-connect-user
+    passwordSecret:
+      secretName: kafka-connect-user  # K8s Secret created by Strimzi KafkaUser CR
+      password: password
+
+  config:
+    # ─── Internal State Topics ────────────────────────────────────────────
+    config.storage.topic: connect-configs
+    config.storage.replication.factor: 3
+
+    # offset.storage: tracks WHERE each source connector (Debezium) has read up to
+    # 25 partitions: supports 25 concurrent source connector tasks (Debezium + other sources)
+    offset.storage.topic: connect-offsets
+    offset.storage.replication.factor: 3
+    offset.storage.partitions: 25
+
+    status.storage.topic: connect-status
+    status.storage.replication.factor: 3
+    status.storage.partitions: 5
+
+    # ─── Converters ───────────────────────────────────────────────────────
+    # Avro: binary format, schema-evolved, 3-5× smaller than JSON
+    # Schema Registry URL: Apicurio compatibility API (Confluent-compatible endpoint)
+    key.converter: io.confluent.kafka.serializers.KafkaAvroSerializer
+    key.converter.schema.registry.url: http://apicurio-registry.schema-registry.svc:8080/apis/ccompat/v6
+
+    value.converter: io.confluent.kafka.serializers.KafkaAvroSerializer
+    value.converter.schema.registry.url: http://apicurio-registry.schema-registry.svc:8080/apis/ccompat/v6
+    key.converter.schemas.enable: "false"     # Don't embed schema in message (Registry handles it)
+    value.converter.schemas.enable: "false"
+
+    # ─── Performance Tuning ───────────────────────────────────────────────
+    # offset.flush.interval.ms: how often Debezium commits WAL offset to Kafka
+    # 10s: if Debezium crashes, at most 10s of CDC events are re-read from WAL
+    offset.flush.interval.ms: 10000
+
+    # Producer settings — applied to all source connectors (Debezium)
+    producer.override.acks: all               # Wait for all ISR replicas — no data loss
+    producer.override.compression.type: lz4
+    producer.override.batch.size: 32768       # 32KB batches — better throughput
+    producer.override.linger.ms: 5            # 5ms linger — batching vs latency tradeoff
+
+    # Consumer settings — applied to all sink connectors (S3 Sink)
+    consumer.override.fetch.min.bytes: 65536
+    consumer.override.fetch.max.wait.ms: 500
+    consumer.override.max.poll.records: 5000  # Larger poll = bigger S3 Parquet files per flush
+    consumer.override.auto.offset.reset: earliest
+
+    # Config provider: allows connectors to reference ${env:VAR_NAME} from env vars
+    # mounted via externalConfiguration.env below
+    config.providers: env
+    config.providers.env.class: org.apache.kafka.common.config.provider.EnvVarConfigProvider
+
+  # ─── SECRET INJECTION VIA ESO ─────────────────────────────────────────────
+  # externalConfiguration.env: mounts K8s Secret keys as environment variables
+  # into Connect worker pods. Connectors reference them as ${env:VAR_NAME}.
+  #
+  # K8s Secret 'postgres-cdc-credentials' is created by ESO from Secrets Manager
+  # path 'de-platform/prod/kafka-connect/postgres-cdc'.
+  externalConfiguration:
+    env:
+      # ─── PostgreSQL Debezium credentials ──────────────────────────────
+      - name: POSTGRES_DB_HOSTNAME
+        valueFrom:
+          secretKeyRef:
+            name: postgres-cdc-credentials   # Created by ESO
+            key: hostname
+      - name: POSTGRES_DB_PORT
+        valueFrom:
+          secretKeyRef:
+            name: postgres-cdc-credentials
+            key: port
+      - name: POSTGRES_DB_USERNAME
+        valueFrom:
+          secretKeyRef:
+            name: postgres-cdc-credentials
+            key: username
+      - name: POSTGRES_DB_PASSWORD
+        valueFrom:
+          secretKeyRef:
+            name: postgres-cdc-credentials
+            key: password
+
+      # ─── MySQL Debezium credentials ───────────────────────────────────
+      - name: MYSQL_DB_HOSTNAME
+        valueFrom:
+          secretKeyRef:
+            name: mysql-cdc-credentials      # Created by ESO
+            key: hostname
+      - name: MYSQL_DB_PORT
+        valueFrom:
+          secretKeyRef:
+            name: mysql-cdc-credentials
+            key: port
+      - name: MYSQL_DB_USERNAME
+        valueFrom:
+          secretKeyRef:
+            name: mysql-cdc-credentials
+            key: username
+      - name: MYSQL_DB_PASSWORD
+        valueFrom:
+          secretKeyRef:
+            name: mysql-cdc-credentials
+            key: password
+
+  # Strimzi builds a custom Connect image: base image + Debezium JARs + S3 Sink JAR
+  # Built by Kaniko on cluster — pushed to ECR
+  # WHY? Default Connect image has no connector plugins. Custom image = zero manual JAR management.
+  build:
+    output:
+      type: docker
+      # PLACEHOLDER: replace 123456789012 with your AWS account ID
+      image: "123456789012.dkr.ecr.ap-south-1.amazonaws.com/de-kafka-connect:prod-latest"
+    plugins:
+      - name: debezium-postgres-connector
+        artifacts:
+          - type: maven
+            group: io.debezium
+            artifact: debezium-connector-postgres
+            version: 2.6.2.Final
+
+      - name: debezium-mysql-connector
+        artifacts:
+          - type: maven
+            group: io.debezium
+            artifact: debezium-connector-mysql
+            version: 2.6.2.Final
+
+      - name: kafka-connect-s3
+        artifacts:
+          - type: maven
+            group: io.confluent
+            artifact: kafka-connect-s3
+            version: 10.7.4
+
+      - name: kafka-connect-avro-converter
+        artifacts:
+          - type: maven
+            group: io.confluent
+            artifact: kafka-connect-avro-converter
+            version: 7.6.1
+
+  resources:
+    # Debezium initial snapshot (large tables) spikes heap to ~6-8GB.
+    # -Xmx must cover that spike; pod limit must cover -Xmx + overhead + direct memory.
+    #   request: 8Gi  — scheduler guarantee; ensures node has RAM before pod lands
+    #   limit:   12Gi — headroom above -Xmx=8GB for GC overhead + direct buffers
+    # c5.2xlarge (8 vCPU, 16GB): 1 worker per node. 12Gi limit leaves 4GB for OS.
+    requests:
+      memory: 8Gi
+      cpu: "2"
+    limits:
+      memory: 12Gi
+      cpu: "6"
+
+  jvmOptions:
+    -Xms: 2048m
+    # 8GB — required for Debezium initial snapshot of large tables.
+    # Prior value (4096m) caused GC thrashing / OOMError during snapshot because the
+    # JVM cannot grow heap beyond -Xmx regardless of pod memory limit. Extra pod RAM
+    # above -Xmx is inaccessible to the heap.
+    -Xmx: 8192m
+    gcLoggingEnabled: true
+
+  metricsConfig:
+    type: jmxPrometheusExporter
+    valueFrom:
+      configMapKeyRef:
+        name: connect-jmx-exporter-config
+        key: connect-metrics-config.yml
+
+  template:
+    pod:
+      serviceAccountName: kafka-connect-sa   # IRSA SA for S3 writes
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: kafka-connect
+          effect: NoSchedule
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: de-connect-cluster
+                topologyKey: kubernetes.io/hostname
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: role
+                    operator: In
+                    values:
+                      - kafka-connect

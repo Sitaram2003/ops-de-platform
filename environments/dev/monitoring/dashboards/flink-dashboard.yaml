@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flink-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+    environment: dev
+data:
+  flink-dashboard.json: |
+    {"title": "Flink Overview", "uid": "flink-overview", "panels": []}

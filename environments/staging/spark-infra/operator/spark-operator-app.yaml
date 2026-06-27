@@ -1,0 +1,40 @@
+# Spark Operator — Staging ArgoCD Application
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: spark-operator-staging
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    component: spark-operator
+    environment: staging
+  annotations:
+    argocd.argoproj.io/sync-wave: "-5"
+spec:
+  project: de-platform
+  source:
+    repoURL: https://kubeflow.github.io/spark-operator
+    chart: spark-operator
+    targetRevision: 1.4.6
+    helm:
+      parameters:
+        - name: sparkJobNamespace
+          value: spark
+        - name: enableWebhook
+          value: "true"
+        - name: resources.requests.memory
+          value: 256Mi
+        - name: resources.requests.cpu
+          value: 250m
+        - name: resources.limits.memory
+          value: 512Mi
+        - name: resources.limits.cpu
+          value: 500m
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: spark
+  syncPolicy:
+    automated: null   # Manual sync
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

@@ -1,0 +1,122 @@
+# =============================================================================
+# AIRFLOW — ArgoCD Application (Prod + Dev)
+# =============================================================================
+# Apache Airflow 2.9.x — orchestrates the Spark batch pipeline.
+# Replaces ScheduledSparkApplication cron scheduling with a dependency-aware
+# DAG: dq_report >> [clickstream_agg, transaction_analytics]
+#
+# Multi-source pattern (ArgoCD 2.6+):
+#   source[0] — Helm chart from the Apache Airflow Helm repo
+#   source[1] — values file from this git repo (ref: values)
+#   The $values alias lets source[0] reference source[1]'s files.
+#
+# Why multi-source instead of embedded values:
+#   - helm-values.yaml is a plain YAML file — diff-able, reviewable in PRs
+#   - values and application wiring are in separate files with separate concerns
+#   - Chart upgrades (targetRevision bump) don't touch the values file
+#
+# DAGs: git-sync sidecar (built into the Airflow chart) clones this repo
+#   and exposes airflow/ as the DAGs root. No ConfigMap needed.
+#
+# ArgoCD sync-wave: "-5" (after namespaces at -10, before RBAC/DAGs at 0)
+# =============================================================================
+
+# ─── Prod ─────────────────────────────────────────────────────────────────────
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: airflow-prod
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    component: airflow
+    environment: prod
+  annotations:
+    argocd.argoproj.io/sync-wave: "-5"
+spec:
+  project: de-platform
+  sources:
+    # ── Helm chart (upstream Apache Airflow chart) ─────────────────────────
+    - repoURL: https://airflow.apache.org
+      chart: airflow
+      targetRevision: 1.15.0    # Ships Apache Airflow 2.9.x
+      helm:
+        valueFiles:
+          - $values/environments/prod/airflow/helm-values.yaml
+
+    # ── Values source (this git repo) — aliased as $values above ──────────
+    - repoURL: https://github.com/your-org/de-platform.git
+      targetRevision: main
+      ref: values
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: airflow
+
+  syncPolicy:
+    automated:
+      prune: false        # Never auto-prune Airflow — would wipe DAG history
+      selfHeal: false
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - Replace=true      # Helm CRDs can exceed kubectl annotation limit
+  ignoreDifferences:
+    # Airflow webserver autoscales its own replica count
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas
+    # ESO manages Secret data — ArgoCD should not diff it
+    - group: ""
+      kind: Secret
+      jsonPointers:
+        - /data
+
+---
+# ─── Dev ──────────────────────────────────────────────────────────────────────
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: airflow-dev
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    component: airflow
+    environment: dev
+  annotations:
+    argocd.argoproj.io/sync-wave: "-5"
+spec:
+  project: de-platform
+  sources:
+    - repoURL: https://airflow.apache.org
+      chart: airflow
+      targetRevision: 1.15.0
+      helm:
+        valueFiles:
+          - $values/environments/dev/airflow/helm-values.yaml
+
+    - repoURL: https://github.com/your-org/de-platform.git
+      targetRevision: main
+      ref: values
+
+  destination:
+    server: https://kubernetes.default.svc   # PLACEHOLDER: dev cluster API endpoint
+    namespace: airflow
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas
+    - group: ""
+      kind: Secret
+      jsonPointers:
+        - /data

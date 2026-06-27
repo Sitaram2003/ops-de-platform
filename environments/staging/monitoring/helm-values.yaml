@@ -1,0 +1,52 @@
+# kube-prometheus-stack Helm values — Staging
+# Intermediate retention/storage between dev and prod.
+# PagerDuty for critical alerts; Slack for warning (same as prod but staging channels).
+
+prometheus:
+  prometheusSpec:
+    retention: 30d
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp3-general
+          resources:
+            requests:
+              storage: 50Gi
+
+alertmanager:
+  config:
+    global:
+      slack_api_url: "https://hooks.slack.com/services/PLACEHOLDER"
+      pagerduty_url: "https://events.pagerduty.com/v2/enqueue"
+    route:
+      group_by: [alertname, namespace, environment]
+      receiver: slack-staging
+      routes:
+        - matchers:
+            - severity = critical
+          receiver: pagerduty-staging
+          continue: true
+        - matchers:
+            - severity = critical
+          receiver: slack-staging
+    receivers:
+      - name: slack-staging
+        slack_configs:
+          - channel: "#de-alerts-staging"
+            send_resolved: true
+      - name: pagerduty-staging
+        pagerduty_configs:
+          - routing_key: "PLACEHOLDER_PAGERDUTY_STAGING_KEY"
+            description: "{{ .CommonAnnotations.summary }}"
+            severity: "{{ .CommonLabels.severity }}"
+
+grafana:
+  adminPassword: ""   # Set via grafana-admin-secret (ESO-managed)
+  persistence:
+    enabled: true
+    size: 5Gi
+    storageClassName: gp3-general
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard

@@ -1,0 +1,33 @@
+# Runs on every PR that changes .yaml files. Validates manifests before merge.
+name: Validate Manifests
+
+on:
+  pull_request:
+    paths: ["**/*.yaml", "**/*.yml"]
+
+jobs:
+  kubeval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install kubeval
+        run: |
+          curl -fsSL https://github.com/instrumenta/kubeval/releases/latest/download/kubeval-linux-amd64.tar.gz \
+            | tar -xz -C /usr/local/bin
+      - name: Validate Kubernetes manifests
+        run: |
+          find environments/ -name "*.yaml" \
+            ! -path "*/helm-values.yaml" \
+            ! -path "*/cluster.yaml" \
+            | xargs kubeval --strict --ignore-missing-schemas
+
+  conftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install conftest
+        run: |
+          curl -fsSL https://github.com/open-policy-agent/conftest/releases/latest/download/conftest_Linux_x86_64.tar.gz \
+            | tar -xz -C /usr/local/bin
+      - name: OPA policy checks
+        run: conftest test environments/prod/ --policy policy/

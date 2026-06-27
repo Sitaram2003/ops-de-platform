@@ -1,0 +1,38 @@
+# Debezium PostgreSQL CDC Connector — Staging
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaConnector
+metadata:
+  name: debezium-postgres-transactions-staging
+  namespace: kafka-connect
+  labels:
+    strimzi.io/cluster: de-connect-cluster
+    environment: staging
+spec:
+  class: io.debezium.connector.postgresql.PostgresConnector
+  tasksMax: 1
+  config:
+    database.hostname: "${env:POSTGRES_DB_HOSTNAME}"
+    database.port: "${env:POSTGRES_DB_PORT}"
+    database.user: "${env:POSTGRES_DB_USERNAME}"
+    database.password: "${env:POSTGRES_DB_PASSWORD}"
+    database.dbname: app_db_staging
+    database.server.name: staging-app-db
+    plugin.name: pgoutput
+    slot.name: debezium_staging
+    publication.name: debezium_publication
+    table.include.list: "public.orders,public.users,public.products,public.payments,public.inventory"
+    topic.prefix: cdc
+    transforms: unwrap,addHeader,filter
+    transforms.unwrap.type: io.debezium.transforms.ExtractNewRecordState
+    transforms.unwrap.drop.tombstones: "false"
+    transforms.unwrap.delete.handling.mode: rewrite
+    transforms.addHeader.type: org.apache.kafka.connect.transforms.InsertHeader
+    transforms.addHeader.header: source-env
+    transforms.addHeader.value.literal: staging
+    transforms.filter.type: io.debezium.transforms.Filter
+    transforms.filter.condition: "value.__op != 'd' || headers.hasHeader('keep-deletes')"
+    errors.deadletterqueue.topic.name: dlq.cdc.postgres-app-db
+    errors.deadletterqueue.context.headers.enable: "true"
+    errors.tolerance: all
+    heartbeat.interval.ms: "10000"
+    snapshot.mode: initial

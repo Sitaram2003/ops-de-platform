@@ -1,0 +1,55 @@
+# =============================================================================
+# SPARK ALERT RULES — PrometheusRule (Dev)
+# =============================================================================
+# Dev: all alerts are warning severity (no PagerDuty pages).
+# Spark jobs in dev are plain SparkApplications (manually triggered), so
+# "ScheduledSparkApplication missing run" alerts don't apply.
+# =============================================================================
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: spark-alert-rules
+  namespace: monitoring
+  labels:
+    prometheus: kube-prometheus
+    role: alert-rules
+    app.kubernetes.io/part-of: de-platform
+    environment: dev
+spec:
+  groups:
+    - name: spark.dev.health
+      interval: 60s
+      rules:
+
+        # Job failed in dev — warning only, no page
+        - alert: SparkJobFailedDev
+          expr: spark_app_count{state="FAILED"} > 0
+          for: 5m
+          labels:
+            severity: warning
+            team: data-engineering
+            service: spark
+            environment: dev
+          annotations:
+            summary: "[DEV] {{ $value }} Spark job(s) in FAILED state"
+            description: |
+              [DEV] A Spark job has failed in the dev environment.
+              Check: kubectl get sparkapplication -n spark
+            runbook: "https://wiki.internal/runbooks/spark/job-failed"
+
+        # Operator down in dev — warning only
+        - alert: SparkOperatorDownDev
+          expr: absent(spark_app_count)
+          for: 10m   # Longer window — dev operator may be redeploying
+          labels:
+            severity: warning
+            team: data-engineering
+            service: spark
+            environment: dev
+          annotations:
+            summary: "[DEV] spark-on-k8s-operator is not emitting metrics"
+            description: |
+              [DEV] spark_app_count metric absent for 10+ minutes.
+              Check: kubectl get pods -n spark -l app.kubernetes.io/name=spark-operator
+            runbook: "https://wiki.internal/runbooks/spark/operator-down"

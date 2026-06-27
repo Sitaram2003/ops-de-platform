@@ -1,0 +1,145 @@
+# =============================================================================
+# AIRFLOW HELM VALUES — Staging
+# =============================================================================
+# Intermediate resources between dev and prod.
+# PostgreSQL persistence enabled (unlike dev — staging validates upgrades).
+# git-sync branch: main
+# Remote logging enabled (staging uses S3 for log inspection).
+# =============================================================================
+
+executor: KubernetesExecutor
+
+# ── Airflow config overrides ──────────────────────────────────────────────────
+config:
+  core:
+    dags_are_paused_at_creation: "true"
+    load_examples: "false"
+    dags_folder: /opt/airflow/dags/repo/HEAD/dags
+  kubernetes_executor:
+    namespace: airflow
+    worker_service_account_name: airflow-sa
+  logging:
+    remote_logging: "true"
+    remote_log_conn_id: aws_default
+    remote_base_log_folder: "s3://de-airflow-logs-staging/logs"
+
+# ── DAGs via git-sync ─────────────────────────────────────────────────────────
+dags:
+  persistence:
+    enabled: false
+  gitSync:
+    enabled: true
+    repo: git@github.com:your-org/de-jobs.git   # DAGs live in de-jobs, not de-platform
+    branch: main
+    rev: HEAD
+    depth: 1
+    subPath: airflow   # exposes de-jobs/airflow/ → repo/HEAD/; dags_folder = repo/HEAD/dags
+    sshKeySecret: git-credentials
+    period: 60s
+    containerName: git-sync
+
+# ── Scheduler ─────────────────────────────────────────────────────────────────
+scheduler:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: "1Gi"
+
+# ── Webserver ─────────────────────────────────────────────────────────────────
+webserver:
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: "1Gi"
+  service:
+    type: ClusterIP
+  defaultUser:
+    enabled: true
+    role: Admin
+    username: admin
+    email: de-platform@company.com
+    firstName: Airflow
+    lastName: Admin
+    password: ~
+
+# ── Triggerer ─────────────────────────────────────────────────────────────────
+triggerer:
+  enabled: true
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# ── Security ──────────────────────────────────────────────────────────────────
+fernetKeySecretName: airflow-fernet-key
+webserverSecretKeySecretName: airflow-webserver-secret
+
+# ── PostgreSQL — persistence enabled in staging ───────────────────────────────
+postgresql:
+  enabled: true
+  auth:
+    existingSecret: airflow-postgres-secret
+    secretKeys:
+      adminPasswordKey: postgresql-password
+  primary:
+    persistence:
+      enabled: true
+      size: 20Gi
+      storageClass: gp3-general
+    resources:
+      requests:
+        cpu: 500m
+        memory: 512Mi
+      limits:
+        cpu: "1"
+        memory: "1Gi"
+
+# ── Service account ───────────────────────────────────────────────────────────
+serviceAccount:
+  create: false
+  name: airflow-sa
+
+# ── Node placement: operators-ng ──────────────────────────────────────────────
+tolerations:
+  - key: dedicated
+    operator: Equal
+    value: operators
+    effect: NoSchedule
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: role
+              operator: In
+              values:
+                - operators
+
+# ── Airflow Variables (injected as environment variables) ─────────────────────
+env:
+  - name: AIRFLOW_VAR_SPARK_DQ_REPORT_IMAGE
+    value: "PLACEHOLDER_ECR/spark-dq-report:latest"
+  - name: AIRFLOW_VAR_SPARK_CLICKSTREAM_AGG_IMAGE
+    value: "PLACEHOLDER_ECR/spark-clickstream-agg:latest"
+  - name: AIRFLOW_VAR_SPARK_TRANSACTION_ANALYTICS_IMAGE
+    value: "PLACEHOLDER_ECR/spark-transaction-analytics:latest"
+  - name: AIRFLOW_VAR_S3_DATA_LAKE_BUCKET
+    value: "de-data-lake-staging"
+  - name: AIRFLOW_VAR_SNOWFLAKE_WAREHOUSE
+    value: "STAGING_WAREHOUSE"
+  - name: AIRFLOW_VAR_SPARK_EXECUTOR_INSTANCES
+    value: "2"
+  - name: AIRFLOW_VAR_SPARK_EXECUTOR_MEMORY
+    value: "8g"
+  - name: AIRFLOW_VAR_SPARK_EXECUTOR_CORES
+    value: "2"

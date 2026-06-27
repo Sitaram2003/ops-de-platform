@@ -1,0 +1,68 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: flink-alert-rules
+  namespace: monitoring
+  labels:
+    prometheus: kube-prometheus
+    role: alert-rules
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+spec:
+  groups:
+    - name: flink.critical.jobs
+      interval: 30s
+      rules:
+        - alert: FlinkJobNotRunning
+          expr: flink_jobmanager_job_uptime == 0
+          for: 2m
+          labels:
+            severity: critical
+            team: data-engineering
+            service: flink
+            environment: staging
+          annotations:
+            summary: "Flink job {{ $labels.flink_job }} is not running (staging)"
+            description: |
+              FlinkDeployment '{{ $labels.flink_job }}' job uptime has been 0 for 2+ minutes.
+              Check: kubectl get flinkdeployment -n flink {{ $labels.flink_job }}
+            runbook: "https://wiki.internal/runbooks/flink/job-not-running"
+
+        - alert: FlinkCheckpointFailureSpike
+          expr: increase(flink_jobmanager_job_numberOfFailedCheckpoints[10m]) > 3
+          for: 0m
+          labels:
+            severity: critical
+            team: data-engineering
+            service: flink
+            environment: staging
+          annotations:
+            summary: "Flink job {{ $labels.flink_job }} had {{ $value | humanize }} checkpoint failures in 10 minutes (staging)"
+            runbook: "https://wiki.internal/runbooks/flink/checkpoint-failure"
+
+    - name: flink.warning.stability
+      interval: 30s
+      rules:
+        - alert: FlinkHighRestartRate
+          expr: increase(flink_jobmanager_numRestarts[30m]) > 5
+          for: 0m
+          labels:
+            severity: warning
+            team: data-engineering
+            service: flink
+            environment: staging
+          annotations:
+            summary: "Flink job {{ $labels.flink_job }} restarted {{ $value | humanize }} times in 30 minutes (staging)"
+            runbook: "https://wiki.internal/runbooks/flink/high-restart-rate"
+
+        - alert: FlinkBackpressureHigh
+          expr: avg by (flink_job) (flink_taskmanager_job_task_isBackPressured) > 0.5
+          for: 5m
+          labels:
+            severity: warning
+            team: data-engineering
+            service: flink
+            environment: staging
+          annotations:
+            summary: "Flink job {{ $labels.flink_job }} is {{ $value | humanizePercentage }} backpressured (staging)"
+            runbook: "https://wiki.internal/runbooks/flink/backpressure"

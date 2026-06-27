@@ -1,0 +1,214 @@
+# Staging Kafka Users — same users as prod, environment: staging label
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: clickstream-producer
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: de-kafka-cluster
+    app.kubernetes.io/part-of: de-platform
+    team: platform
+    environment: staging
+spec:
+  authentication:
+    type: scram-sha-512
+  authorization:
+    type: simple
+    acls:
+      - resource:
+          type: topic
+          name: app.clickstream.events
+          patternType: literal
+        operations:
+          - Write
+          - Describe
+        host: "*"
+      - resource:
+          type: transactionalId
+          name: clickstream-txn-
+          patternType: prefix
+        operations:
+          - Write
+        host: "*"
+
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: flink-processor
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: de-kafka-cluster
+    app.kubernetes.io/part-of: de-platform
+    team: data-engineering
+    environment: staging
+spec:
+  authentication:
+    type: scram-sha-512
+  authorization:
+    type: simple
+    acls:
+      - resource:
+          type: topic
+          name: app.
+          patternType: prefix
+        operations:
+          - Read
+          - Describe
+        host: "*"
+      - resource:
+          type: topic
+          name: cdc.
+          patternType: prefix
+        operations:
+          - Read
+          - Describe
+        host: "*"
+      - resource:
+          type: group
+          name: flink-
+          patternType: prefix
+        operations:
+          - Read
+          - Describe
+        host: "*"
+      - resource:
+          type: topic
+          name: processed.
+          patternType: prefix
+        operations:
+          - Write
+          - Describe
+          - Create
+        host: "*"
+      - resource:
+          type: transactionalId
+          name: flink-
+          patternType: prefix
+        operations:
+          - Write
+          - Describe
+        host: "*"
+
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: spark-processor
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: de-kafka-cluster
+    app.kubernetes.io/part-of: de-platform
+    team: data-engineering
+    environment: staging
+spec:
+  authentication:
+    type: scram-sha-512
+  authorization:
+    type: simple
+    acls:
+      - resource:
+          type: topic
+          name: processed.
+          patternType: prefix
+        operations:
+          - Read
+          - Describe
+        host: "*"
+      - resource:
+          type: topic
+          name: app.
+          patternType: prefix
+        operations:
+          - Read
+          - Describe
+        host: "*"
+      - resource:
+          type: group
+          name: spark-
+          patternType: prefix
+        operations:
+          - Read
+          - Describe
+        host: "*"
+
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: kafka-connect-user
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: de-kafka-cluster
+    app.kubernetes.io/part-of: de-platform
+    team: data-engineering
+    environment: staging
+spec:
+  authentication:
+    type: scram-sha-512
+  authorization:
+    type: simple
+    acls:
+      - resource:
+          type: topic
+          name: "*"
+          patternType: literal
+        operations:
+          - Read
+          - Write
+          - Describe
+          - Create
+        host: "*"
+      - resource:
+          type: group
+          name: connect-
+          patternType: prefix
+        operations:
+          - Read
+          - Write
+          - Describe
+        host: "*"
+      - resource:
+          type: group
+          name: s3-sink-
+          patternType: prefix
+        operations:
+          - Read
+          - Describe
+        host: "*"
+
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: schema-registry-user
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: de-kafka-cluster
+    app.kubernetes.io/part-of: de-platform
+    team: data-engineering
+    environment: staging
+spec:
+  authentication:
+    type: scram-sha-512
+  authorization:
+    type: simple
+    acls:
+      - resource:
+          type: topic
+          name: _schemas
+          patternType: literal
+        operations:
+          - Read
+          - Write
+          - Describe
+          - Create
+        host: "*"
+      - resource:
+          type: group
+          name: schema-registry-
+          patternType: prefix
+        operations:
+          - Read
+          - Describe
+        host: "*"

@@ -1,0 +1,37 @@
+# =============================================================================
+# SPARK SERVICE MONITOR — Prometheus Scrape Config (Dev)
+# =============================================================================
+# Same as prod — targets spark-operator Service in the spark namespace.
+# Dev operator is installed by the dev-spark ArgoCD Application.
+# =============================================================================
+
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: spark-operator-service-monitor
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: dev
+    prometheus: kube-prometheus
+spec:
+  namespaceSelector:
+    matchNames:
+      - spark
+
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: spark-operator
+
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 60s      # Less frequent in dev
+      scrapeTimeout: 10s
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_service_namespace]
+          targetLabel: namespace
+        - sourceLabels: [__meta_kubernetes_service_name]
+          targetLabel: service
+        - targetLabel: environment
+          replacement: dev

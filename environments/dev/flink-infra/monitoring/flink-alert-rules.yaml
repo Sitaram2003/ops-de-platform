@@ -1,0 +1,56 @@
+# =============================================================================
+# FLINK ALERT RULES — PrometheusRule (Dev)
+# =============================================================================
+# Dev differences from prod:
+#   • All thresholds relaxed (3× prod values) — dev jobs have lower throughput
+#     and are frequently restarted deliberately for testing.
+#   • severity=warning for everything — no PagerDuty pages from dev.
+#   • Longer "for" durations — avoid noise from intentional dev restarts.
+# =============================================================================
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: flink-alert-rules
+  namespace: monitoring
+  labels:
+    prometheus: kube-prometheus
+    role: alert-rules
+    app.kubernetes.io/part-of: de-platform
+    environment: dev
+spec:
+  groups:
+    - name: flink.dev.jobs
+      interval: 60s    # Less frequent evaluation in dev
+      rules:
+
+        # Job not running for 5min (vs 2min in prod) — dev jobs are often stopped intentionally
+        - alert: FlinkJobNotRunningDev
+          expr: flink_jobmanager_job_uptime == 0
+          for: 5m
+          labels:
+            severity: warning
+            team: data-engineering
+            service: flink
+            environment: dev
+          annotations:
+            summary: "[DEV] Flink job {{ $labels.flink_job }} is not running"
+            description: |
+              [DEV] FlinkDeployment '{{ $labels.flink_job }}' has not been running for 5+ minutes.
+              This is a warning only — no PagerDuty page.
+            runbook: "https://wiki.internal/runbooks/flink/job-not-running"
+
+        # > 10 checkpoint failures in 10 min (vs 3 in prod) — dev has more transient failures
+        - alert: FlinkCheckpointFailureSpikedev
+          expr: increase(flink_jobmanager_job_numberOfFailedCheckpoints[10m]) > 10
+          for: 0m
+          labels:
+            severity: warning
+            team: data-engineering
+            service: flink
+            environment: dev
+          annotations:
+            summary: "[DEV] Flink job {{ $labels.flink_job }} had {{ $value | humanize }} checkpoint failures"
+            description: |
+              [DEV] Checkpoint failures in job '{{ $labels.flink_job }}'. Check S3 dev bucket access.
+            runbook: "https://wiki.internal/runbooks/flink/checkpoint-failure"

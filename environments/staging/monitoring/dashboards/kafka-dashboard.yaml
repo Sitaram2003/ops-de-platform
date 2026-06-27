@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+    environment: staging
+data:
+  kafka-dashboard.json: |
+    {"title": "Kafka Overview", "uid": "kafka-overview", "panels": []}

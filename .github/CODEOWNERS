@@ -1,0 +1,15 @@
+# CODEOWNERS — controls who must approve PRs to each environment path.
+# GitHub enforces at least one approval from the matching owner(s).
+
+# Prod requires platform lead + engineering lead (2 approvals enforced via branch protection)
+environments/prod/                  @your-org/platform-leads @your-org/eng-leads
+
+# Staging requires engineering lead (1 approval)
+environments/staging/               @your-org/eng-leads
+
+# Dev is auto-merged by ci.yml — no human approval required
+# (GitHub App token used by CI has merge permission on dev paths)
+
+# ArgoCD config and bootstrap changes always need platform review
+argocd/                             @your-org/platform-leads
+cluster-bootstrap/                  @your-org/platform-leads

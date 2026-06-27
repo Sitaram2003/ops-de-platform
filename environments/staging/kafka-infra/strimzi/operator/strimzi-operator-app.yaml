@@ -1,0 +1,41 @@
+# Strimzi Operator — Staging
+# Installs Strimzi Kafka operator targeting the staging cluster.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: strimzi-operator-staging
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    component: strimzi
+    environment: staging
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+spec:
+  project: de-platform
+  source:
+    repoURL: https://strimzi.io/charts/
+    chart: strimzi-kafka-operator
+    targetRevision: 0.40.0
+    helm:
+      parameters:
+        - name: watchNamespaces
+          value: "{kafka}"
+        - name: logLevel
+          value: INFO
+        - name: resources.requests.memory
+          value: 256Mi
+        - name: resources.requests.cpu
+          value: 200m
+        - name: resources.limits.memory
+          value: 512Mi
+        - name: resources.limits.cpu
+          value: 500m
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kafka
+  syncPolicy:
+    automated: null   # Manual sync — staging requires explicit approval
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

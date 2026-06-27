@@ -1,0 +1,13 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: kafka-connect-pdb
+  namespace: kafka-connect
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      strimzi.io/cluster: de-connect-cluster

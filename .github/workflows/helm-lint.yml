@@ -1,0 +1,28 @@
+# Lints any changed helm-values.yaml files against the chart.
+name: Helm Lint
+
+on:
+  pull_request:
+    paths: ["**/helm-values.yaml"]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v3
+        with: { version: "3.14.0" }
+      - name: Lint Airflow values
+        run: |
+          helm repo add apache-airflow https://airflow.apache.org
+          helm repo update
+          for f in $(git diff --name-only HEAD~1 HEAD | grep airflow/helm-values.yaml); do
+            echo "Linting $f"
+            helm lint apache-airflow/airflow -f "$f" --strict
+          done
+      - name: Lint monitoring values
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          for f in $(git diff --name-only HEAD~1 HEAD | grep monitoring/helm-values.yaml); do
+            helm lint prometheus-community/kube-prometheus-stack -f "$f"
+          done

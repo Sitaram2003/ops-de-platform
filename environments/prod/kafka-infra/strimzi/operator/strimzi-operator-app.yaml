@@ -1,0 +1,147 @@
+# =============================================================================
+# STRIMZI OPERATOR INSTALLATION REFERENCE
+# =============================================================================
+# The Strimzi Operator manages all Kafka CRDs (Kafka, KafkaNodePool,
+# KafkaConnect, KafkaTopic, KafkaUser, KafkaConnector, etc.)
+#
+# Installation method: Helm (recommended for version pinning + ArgoCD management)
+#
+# ArgoCD will deploy this Application FIRST (before kafka cluster configs).
+# The Strimzi operator must be running before any Kafka/* CRDs can be applied.
+#
+# Deployment order:
+#   1. namespaces.yaml            (create namespaces)
+#   2. storage-classes.yaml       (create StorageClasses)
+#   3. external-secrets/          (create ESO — needed for secrets)
+#   4. strimzi/operator/          (install Strimzi operator — waits for CRDs)
+#   5. strimzi/kafka/             (Kafka cluster + node pools)
+#   6. strimzi/security/          (KafkaUser CRs)
+#   7. strimzi/topics/            (KafkaTopic CRs)
+#   8. schema-registry/           (Apicurio Registry)
+#   9. kafka-connect/             (KafkaConnect cluster + KafkaConnector CRs)
+#   10. monitoring/               (Prometheus rules + Grafana dashboards)
+#   11. keda/                     (ScaledObjects — Flink TM auto-scaling)
+# =============================================================================
+
+# ─── Strimzi Operator — ArgoCD Application ────────────────────────────────────
+# This Application deploys Strimzi via its official Helm chart.
+# ArgoCD will run this BEFORE the kafka-applicationset (controlled by sync waves).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: strimzi-operator-prod
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    component: strimzi-operator
+    environment: prod
+  annotations:
+    # Sync wave -10: deploy operator BEFORE all Kafka CRs (wave 0)
+    # ArgoCD processes lower wave numbers first
+    argocd.argoproj.io/sync-wave: "-10"
+spec:
+  project: de-platform
+  source:
+    repoURL: https://strimzi.io/charts/
+    chart: strimzi-kafka-operator
+    targetRevision: 0.41.0           # Pin Strimzi version — matches Kafka 3.7.0
+
+    helm:
+      values: |
+        # Watch all namespaces (operator manages Kafka CRs across namespaces)
+        watchNamespaces:
+          - kafka
+          - kafka-connect
+        # Resources for operator pod (runs on operators-ng node group)
+        resources:
+          requests:
+            memory: 384Mi
+            cpu: "0.2"
+          limits:
+            memory: 768Mi
+            cpu: "1"
+        # Operator pod tolerations + affinity (land on operators-ng nodes)
+        tolerations:
+          - key: dedicated
+            operator: Equal
+            value: operators
+            effect: NoSchedule
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: role
+                      operator: In
+                      values:
+                        - operators
+        # Log level: INFO in prod (DEBUG in dev for troubleshooting)
+        logLevel: INFO
+        # Feature gates: enable KafkaNodePool (required for our config)
+        featureGates: "+UseKRaft,+UseNodePools,+UnidirectionalTopicOperatorMode"
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kafka
+
+  syncPolicy:
+    automated:
+      prune: false                   # Never auto-prune operator — could delete all Kafka CRs
+      selfHeal: false
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+
+---
+# ─── Strimzi Operator — Dev ───────────────────────────────────────────────────
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: strimzi-operator-dev
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    component: strimzi-operator
+    environment: dev
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+spec:
+  project: de-platform
+  source:
+    repoURL: https://strimzi.io/charts/
+    chart: strimzi-kafka-operator
+    targetRevision: 0.41.0
+
+    helm:
+      values: |
+        watchNamespaces:
+          - kafka
+          - kafka-connect
+        resources:
+          requests:
+            memory: 192Mi
+            cpu: "0.1"
+          limits:
+            memory: 384Mi
+            cpu: "0.5"
+        tolerations:
+          - key: dedicated
+            operator: Equal
+            value: operators
+            effect: NoSchedule
+        logLevel: DEBUG              # DEBUG in dev — easier troubleshooting
+        featureGates: "+UseKRaft,+UseNodePools,+UnidirectionalTopicOperatorMode"
+
+  destination:
+    # PLACEHOLDER: replace with dev cluster API endpoint after registering:
+    # argocd cluster add <dev-kubecontext> --name de-platform-dev
+    server: https://kubernetes.default.svc   # Update for separate dev cluster
+    namespace: kafka
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

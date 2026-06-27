@@ -1,0 +1,87 @@
+# =============================================================================
+# ARGOCD — Namespace
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: argocd
+  labels:
+    app.kubernetes.io/part-of: de-platform
+
+---
+# =============================================================================
+# ARGOCD — Helm Values (install via Helm separately)
+# =============================================================================
+# Install ArgoCD (run once per prod cluster):
+#   helm repo add argo https://argoproj.github.io/argo-helm
+#   helm install argocd argo/argo-cd \
+#     --namespace argocd \
+#     --create-namespace \
+#     --values argocd/install/argocd-values.yaml \
+#     --version 6.7.3
+#
+# This ConfigMap documents the Helm values used.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-helm-values-reference
+  namespace: argocd
+  labels:
+    app: argocd
+    purpose: documentation
+data:
+  values.yaml: |
+    # ─── High Availability ─────────────────────────────────────────────────
+    redis-ha:
+      enabled: true                  # Redis HA (3 nodes) for ArgoCD state storage
+    controller:
+      replicas: 2                    # 2 ArgoCD Application Controllers for HA
+    server:
+      replicas: 2                    # 2 API servers
+    repoServer:
+      replicas: 2                    # 2 repo servers (Git polling)
+    applicationSet:
+      replicas: 2                    # 2 ApplicationSet controllers
+
+    # ─── Auto-Sync (only for dev — prod is manual approval) ────────────────
+    # Controlled at ApplicationSet level — not globally here
+
+    # ─── RBAC (who can sync what) ──────────────────────────────────────────
+    configs:
+      rbac:
+        policy.csv: |
+          # DE team leads can sync prod
+          g, data-engineering-leads, role:admin
+          # All DE engineers can sync dev
+          g, data-engineering, role:readonly
+          p, role:de-engineer, applications, sync, de-platform/dev/*, allow
+          p, role:de-engineer, applications, get, de-platform/*/*, allow
+      cm:
+        # Repo: add in ArgoCD UI or via ArgoCD secret
+        # argocd.server.insecure: "false"
+        url: https://argocd.de.internal.pipelineforge.com  # PLACEHOLDER
+
+    # ─── Notifications (Slack alerts for sync failures) ────────────────────
+    notifications:
+      enabled: true
+      argocdUrl: https://argocd.de.internal.pipelineforge.com  # PLACEHOLDER
+      secret:
+        create: false                # Secret created separately with Slack token
+
+    # ─── Node placement ────────────────────────────────────────────────────
+    global:
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: operators
+          effect: NoSchedule
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: role
+                    operator: In
+                    values:
+                      - operators

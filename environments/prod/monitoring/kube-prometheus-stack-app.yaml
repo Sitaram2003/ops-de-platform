@@ -1,0 +1,422 @@
+# =============================================================================
+# KUBE-PROMETHEUS-STACK — ArgoCD Application (Prod + Dev)
+# =============================================================================
+# Installs the full observability stack:
+#   • Prometheus Operator    — manages Prometheus, Alertmanager, PodMonitor CRDs
+#   • Prometheus             — metrics storage + evaluation engine
+#   • Alertmanager           — alert routing (PagerDuty, Slack)
+#   • Grafana                — dashboards
+#   • kube-state-metrics     — K8s object metrics (pod restarts, deployment status)
+#   • node-exporter          — host-level metrics (CPU, memory, disk, network)
+#
+# ArgoCD sync-wave: -5 (Prometheus CRDs must exist before PodMonitors in other
+# ApplicationSets can be applied successfully)
+#
+# Selector strategy (CRITICAL — wrong selectors = silently missing metrics):
+#   podMonitorSelector: {}        → match ALL PodMonitors in ALL namespaces
+#   ruleSelector: {}              → match ALL PrometheusRules in ALL namespaces
+#   serviceMonitorSelector: {}    → match ALL ServiceMonitors in ALL namespaces
+#   alertmanagerConfigSelector: {} → match ALL AlertmanagerConfigs
+#   *NamespaceSelector: {}        → the {} on these ENABLES cross-namespace discovery
+#   Rationale: Each component (Kafka/Flink/Spark) owns its monitoring YAML
+#   collocated with its infra files. Narrow selectors would require label
+#   coordination across teams — empty selector is simpler and safer here.
+#
+# Dashboard sidecar:
+#   sidecar.dashboards.searchNamespace: ALL → picks up ConfigMaps labeled
+#   grafana_dashboard: "1" from kafka/flink/spark namespaces automatically.
+#   No manual import needed when a new dashboard ConfigMap is deployed.
+#
+# Node placement:
+#   All monitoring pods → monitoring-ng (m5.2xlarge × 2, minSize=2)
+#   Taint: dedicated=monitoring:NoSchedule
+#   Exception: node-exporter is a DaemonSet (runs on all nodes, no taint override needed)
+# =============================================================================
+
+# ─── Prod ─────────────────────────────────────────────────────────────────────
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kube-prometheus-stack-prod
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    component: monitoring
+    environment: prod
+  annotations:
+    argocd.argoproj.io/sync-wave: "-5"
+spec:
+  project: de-platform
+  source:
+    repoURL: https://prometheus-community.github.io/helm-charts
+    chart: kube-prometheus-stack
+    targetRevision: "65.1.1"
+
+    helm:
+      values: |
+        # ── Prometheus Operator ─────────────────────────────────────────────
+        prometheusOperator:
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: "0.1"
+            limits:
+              memory: 512Mi
+              cpu: "0.5"
+          tolerations:
+            - key: dedicated
+              operator: Equal
+              value: monitoring
+              effect: NoSchedule
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                  - matchExpressions:
+                      - key: role
+                        operator: In
+                        values:
+                          - monitoring
+
+        # ── Prometheus ──────────────────────────────────────────────────────
+        prometheus:
+          prometheusSpec:
+            # ── Cross-namespace discovery: empty selector = match everything ─
+            podMonitorSelector: {}
+            podMonitorNamespaceSelector: {}
+            ruleSelector: {}
+            ruleNamespaceSelector: {}
+            serviceMonitorSelector: {}
+            serviceMonitorNamespaceSelector: {}
+
+            # ── Retention ───────────────────────────────────────────────────
+            retention: 15d
+            retentionSize: 90GB   # Stop ingesting when disk > 90GB (leaves 10GB headroom)
+
+            # ── Storage (100Gi on monitoring-ng — m5.2xlarge has ~800GB EBS) ─
+            storageSpec:
+              volumeClaimTemplate:
+                spec:
+                  storageClassName: gp3-general
+                  accessModes: ["ReadWriteOnce"]
+                  resources:
+                    requests:
+                      storage: 100Gi
+
+            # ── Resources ───────────────────────────────────────────────────
+            # m5.2xlarge: 8 vCPU, 32GB. Prometheus + Alertmanager + Grafana
+            # share 2 nodes (~52GB allocatable). Prometheus gets the largest share.
+            resources:
+              requests:
+                memory: 4Gi
+                cpu: "1"
+              limits:
+                memory: 8Gi
+                cpu: "2"
+
+            # ── Node placement ───────────────────────────────────────────────
+            tolerations:
+              - key: dedicated
+                operator: Equal
+                value: monitoring
+                effect: NoSchedule
+            affinity:
+              nodeAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  nodeSelectorTerms:
+                    - matchExpressions:
+                        - key: role
+                          operator: In
+                          values:
+                            - monitoring
+
+            # ── Scrape interval ──────────────────────────────────────────────
+            scrapeInterval: "30s"    # Match PodMonitor scrape intervals
+            evaluationInterval: "30s"
+
+            # ── External labels (useful for multi-cluster federation later) ──
+            externalLabels:
+              cluster: de-platform-prod
+              environment: prod
+
+        # ── Alertmanager ────────────────────────────────────────────────────
+        alertmanager:
+          alertmanagerSpec:
+            # Pick up AlertmanagerConfig CRs from all namespaces
+            alertmanagerConfigSelector: {}
+            alertmanagerConfigNamespaceSelector: {}
+            # Matching label on AlertmanagerConfig: alertmanagerConfig: de-platform
+            alertmanagerConfigMatcherStrategy:
+              type: None   # Don't add namespace matcher to routes — AlertmanagerConfig handles routing
+
+            storage:
+              volumeClaimTemplate:
+                spec:
+                  storageClassName: gp3-general
+                  accessModes: ["ReadWriteOnce"]
+                  resources:
+                    requests:
+                      storage: 10Gi
+
+            resources:
+              requests:
+                memory: 256Mi
+                cpu: "0.1"
+              limits:
+                memory: 512Mi
+                cpu: "0.5"
+
+            tolerations:
+              - key: dedicated
+                operator: Equal
+                value: monitoring
+                effect: NoSchedule
+            affinity:
+              nodeAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  nodeSelectorTerms:
+                    - matchExpressions:
+                        - key: role
+                          operator: In
+                          values:
+                            - monitoring
+
+        # ── Grafana ──────────────────────────────────────────────────────────
+        grafana:
+          # Admin password from ESO-managed K8s Secret (never hardcoded)
+          admin:
+            existingSecret: grafana-admin-secret
+            userKey: admin-user      # Key in the secret for username (set to "admin" if not in secret)
+            passwordKey: admin-password
+
+          # Persistent storage for dashboards saved in Grafana UI + plugins
+          persistence:
+            enabled: true
+            storageClassName: gp3-general
+            size: 10Gi
+            accessModes: ["ReadWriteOnce"]
+
+          # ── Dashboard sidecar: auto-discovers ConfigMaps labeled grafana_dashboard=1 ──
+          # Picks up dashboards from ALL namespaces (kafka/flink/spark).
+          # When a dashboard ConfigMap is deployed, sidecar mounts it into Grafana
+          # automatically — no manual import needed.
+          sidecar:
+            dashboards:
+              enabled: true
+              label: grafana_dashboard
+              labelValue: "1"
+              searchNamespace: ALL    # Scan all namespaces (not just monitoring)
+              provider:
+                allowUiUpdates: false  # Prevent Grafana UI edits from overwriting git state
+            datasources:
+              enabled: true
+              label: grafana_datasource
+              labelValue: "1"
+              searchNamespace: monitoring
+
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: "0.1"
+            limits:
+              memory: 512Mi
+              cpu: "0.5"
+
+          tolerations:
+            - key: dedicated
+              operator: Equal
+              value: monitoring
+              effect: NoSchedule
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                  - matchExpressions:
+                      - key: role
+                        operator: In
+                        values:
+                          - monitoring
+
+          # ── Grafana datasource: Prometheus ───────────────────────────────
+          additionalDataSources:
+            - name: Prometheus
+              type: prometheus
+              url: http://kube-prometheus-stack-prometheus.monitoring.svc:9090
+              isDefault: true
+              access: proxy
+
+        # ── kube-state-metrics ───────────────────────────────────────────────
+        kube-state-metrics:
+          tolerations:
+            - key: dedicated
+              operator: Equal
+              value: monitoring
+              effect: NoSchedule
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                  - matchExpressions:
+                      - key: role
+                        operator: In
+                        values:
+                          - monitoring
+
+        # ── node-exporter (DaemonSet — runs on ALL nodes, no affinity restriction) ─
+        prometheus-node-exporter:
+          tolerations:
+            # Must tolerate ALL taints to run on every node group
+            - operator: Exists
+              effect: NoSchedule
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+
+  syncPolicy:
+    automated:
+      prune: false    # Never auto-delete Prometheus — would destroy metric history
+      selfHeal: false
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - Replace=true   # CRDs need Replace strategy (too large for strategic merge patch)
+
+---
+# ─── Dev ──────────────────────────────────────────────────────────────────────
+# Dev monitoring: no persistent storage (emptyDir), lower resources, 1d retention.
+# Purpose: verify dashboard/alert changes before promoting to prod.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kube-prometheus-stack-dev
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    component: monitoring
+    environment: dev
+  annotations:
+    argocd.argoproj.io/sync-wave: "-5"
+spec:
+  project: de-platform
+  source:
+    repoURL: https://prometheus-community.github.io/helm-charts
+    chart: kube-prometheus-stack
+    targetRevision: "65.1.1"
+
+    helm:
+      values: |
+        prometheusOperator:
+          resources:
+            requests:
+              memory: 128Mi
+              cpu: "0.1"
+            limits:
+              memory: 256Mi
+              cpu: "0.3"
+          tolerations:
+            - key: dedicated
+              operator: Equal
+              value: monitoring
+              effect: NoSchedule
+
+        prometheus:
+          prometheusSpec:
+            podMonitorSelector: {}
+            podMonitorNamespaceSelector: {}
+            ruleSelector: {}
+            ruleNamespaceSelector: {}
+            serviceMonitorSelector: {}
+            serviceMonitorNamespaceSelector: {}
+            retention: 1d
+            retentionSize: 8GB
+            # Dev: no PVC — ephemeral storage (data lost on pod restart)
+            storageSpec: {}
+            resources:
+              requests:
+                memory: 512Mi
+                cpu: "0.2"
+              limits:
+                memory: 1Gi
+                cpu: "1"
+            scrapeInterval: "60s"
+            evaluationInterval: "60s"
+            externalLabels:
+              cluster: de-platform-dev
+              environment: dev
+            tolerations:
+              - key: dedicated
+                operator: Equal
+                value: monitoring
+                effect: NoSchedule
+
+        alertmanager:
+          alertmanagerSpec:
+            alertmanagerConfigSelector: {}
+            alertmanagerConfigNamespaceSelector: {}
+            alertmanagerConfigMatcherStrategy:
+              type: None
+            storage: {}    # No PVC in dev
+            resources:
+              requests:
+                memory: 64Mi
+                cpu: "0.05"
+              limits:
+                memory: 128Mi
+                cpu: "0.2"
+            tolerations:
+              - key: dedicated
+                operator: Equal
+                value: monitoring
+                effect: NoSchedule
+
+        grafana:
+          admin:
+            existingSecret: grafana-admin-secret
+            userKey: admin-user
+            passwordKey: admin-password
+          persistence:
+            enabled: false   # No PVC in dev — dashboards reload from ConfigMaps on restart
+          sidecar:
+            dashboards:
+              enabled: true
+              label: grafana_dashboard
+              labelValue: "1"
+              searchNamespace: ALL
+          resources:
+            requests:
+              memory: 128Mi
+              cpu: "0.1"
+            limits:
+              memory: 256Mi
+              cpu: "0.3"
+          tolerations:
+            - key: dedicated
+              operator: Equal
+              value: monitoring
+              effect: NoSchedule
+
+        kube-state-metrics:
+          tolerations:
+            - key: dedicated
+              operator: Equal
+              value: monitoring
+              effect: NoSchedule
+
+        prometheus-node-exporter:
+          tolerations:
+            - operator: Exists
+              effect: NoSchedule
+
+  destination:
+    server: https://kubernetes.default.svc   # PLACEHOLDER: dev cluster endpoint
+    namespace: monitoring
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - Replace=true

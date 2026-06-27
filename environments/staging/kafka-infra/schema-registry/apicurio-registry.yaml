@@ -1,0 +1,123 @@
+# =============================================================================
+# APICURIO SCHEMA REGISTRY — Staging
+# =============================================================================
+# 2 replicas for HA testing. BACKWARD compat mode (same as prod).
+# =============================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apicurio-registry
+  namespace: schema-registry
+  labels:
+    app: apicurio-registry
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+spec:
+  replicas: 2
+
+  selector:
+    matchLabels:
+      app: apicurio-registry
+
+  template:
+    metadata:
+      labels:
+        app: apicurio-registry
+        app.kubernetes.io/part-of: de-platform
+    spec:
+      serviceAccountName: default
+
+      containers:
+        - name: apicurio-registry
+          image: quay.io/apicurio/apicurio-registry-kafkasql:2.5.11.Final
+          ports:
+            - containerPort: 8080
+              name: http
+
+          env:
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: "de-kafka-cluster-kafka-tls-bootstrap.kafka:9093"
+            - name: REGISTRY_KAFKASQL_SECURITY_PROTOCOL
+              value: "SASL_SSL"
+            - name: REGISTRY_KAFKASQL_SASL_MECHANISM
+              value: "SCRAM-SHA-512"
+            - name: REGISTRY_KAFKASQL_SASL_JAAS_CONFIG
+              valueFrom:
+                secretKeyRef:
+                  name: schema-registry-user
+                  key: sasl.jaas.config
+            - name: REGISTRY_KAFKASQL_SSL_TRUSTSTORE_TYPE
+              value: "PEM"
+            - name: REGISTRY_KAFKASQL_SSL_TRUSTSTORE_CERTIFICATES
+              valueFrom:
+                secretKeyRef:
+                  name: de-kafka-cluster-cluster-ca-cert
+                  key: ca.crt
+            - name: REGISTRY_APIS_COMPATIBILITY_CONFLUENT_API_ENABLED
+              value: "true"
+            - name: REGISTRY_DEFAULT_COMPAT_MODE
+              value: "BACKWARD"    # Same as prod — test schema evolution
+            - name: QUARKUS_HTTP_PORT
+              value: "8080"
+
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: "0.25"
+            limits:
+              memory: 512Mi
+              cpu: "0.5"
+
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 3
+
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: operators
+          effect: NoSchedule
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: apicurio-registry
+  namespace: schema-registry
+  labels:
+    app: apicurio-registry
+    app.kubernetes.io/part-of: de-platform
+    environment: staging
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8080
+      targetPort: 8080
+      name: http
+  selector:
+    app: apicurio-registry
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: apicurio-registry-pdb
+  namespace: schema-registry
+spec:
+  minAvailable: 1    # Keep 1 of 2 replicas available
+  selector:
+    matchLabels:
+      app: apicurio-registry

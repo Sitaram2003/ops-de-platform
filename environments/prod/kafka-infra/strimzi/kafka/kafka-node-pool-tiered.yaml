@@ -1,0 +1,87 @@
+# =============================================================================
+# PROD KAFKA NODE POOL — TIERED STORAGE BROKER
+# =============================================================================
+# Dedicated broker pool for topics with Kafka native tiered storage enabled.
+# These brokers hold HOT data (last 6 hours) on fast io2 EBS; cold segments
+# are automatically uploaded to S3 by the tiered storage plugin.
+#
+# Sizing: identical to the standard broker pool.
+#   Same r5.4xlarge node, same JVM profile, same resource constraints.
+#   Difference: io2 storage (not gp3) for consistent sub-ms read latency on
+#   recent data (Flink reads last 6h heavily during reprocessing).
+#
+#   Volume: 500Gi io2-ultra-fast (50 IOPS/GB × 500GB = 25,000 IOPS)
+#     6h of hot data per partition at moderate throughput fits in 500GB.
+#     Only the leader write rate matters here (S3 tiering offloads old segments).
+#     Tiered-storage volumes do NOT accumulate follower replica lag like gp3
+#     volumes — the tiering plugin removes old segments to S3, so disk usage
+#     stays bounded by local.retention.ms (6 hours), not total retention.
+#
+# Pod memory rationale — same as kafka-node-pool-broker.yaml:
+#   request=20Gi, limit=24Gi, -Xmx=16GB, MaxDirectMemorySize=2048m
+#   OS page cache available: 128 - 24 - 2 = ~102GB per node
+# =============================================================================
+
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaNodePool
+metadata:
+  name: broker-tiered
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: de-kafka-cluster
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+spec:
+  replicas: 3
+
+  roles:
+    - broker
+
+  storage:
+    type: jbod
+    volumes:
+      - id: 0
+        type: persistent-claim
+        size: 500Gi                  # 500GB io2 → 25K IOPS. Hot layer only (6h tiered retention).
+        class: io2-ultra-fast        # 99.999% durability — tiered hot data must never be lost
+        deleteClaim: false
+
+  resources:
+    requests:
+      memory: 20Gi
+      cpu: "6"
+    limits:
+      memory: 24Gi
+      cpu: "12"
+
+  jvmOptions:
+    -Xms: 12288m
+    -Xmx: 16384m
+    gcLoggingEnabled: true
+    genericJvmOptions: "-XX:+UseG1GC -XX:MaxGCPauseMillis=100 -XX:MaxDirectMemorySize=2048m"
+
+  template:
+    pod:
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: kafka-broker
+          effect: NoSchedule
+
+      affinity:
+        podAntiAffinity:
+          # REQUIRED — guarantees 1 tiered broker per EC2 node (see broker pool comments)
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  strimzi.io/pool-name: broker-tiered
+              topologyKey: kubernetes.io/hostname
+
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: role
+                    operator: In
+                    values:
+                      - kafka-broker

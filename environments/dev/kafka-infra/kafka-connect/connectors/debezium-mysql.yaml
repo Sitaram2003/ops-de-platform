@@ -1,0 +1,21 @@
+# Debezium MySQL CDC connector — Dev
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaConnector
+metadata:
+  name: debezium-mysql-dev
+  namespace: kafka-connect
+  labels:
+    strimzi.io/cluster: kafka-connect-cluster
+spec:
+  class: io.debezium.connector.mysql.MySqlConnector
+  tasksMax: 1
+  config:
+    database.hostname: mysql-dev.internal
+    database.port: "3306"
+    database.user: debezium
+    database.password: ${file:/opt/kafka/external-configuration/debezium-mysql-secret/password}
+    database.server.id: "1"
+    topic.prefix: cdc
+    table.include.list: app.gps_events
+    schema.history.internal.kafka.bootstrap.servers: kafka-cluster-kafka-bootstrap.kafka:9092
+    schema.history.internal.kafka.topic: schema-changes.mysql-dev

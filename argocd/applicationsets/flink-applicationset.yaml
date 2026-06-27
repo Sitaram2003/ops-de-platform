@@ -1,0 +1,110 @@
+# =============================================================================
+# ARGOCD APPLICATION SET — Flink Component (Prod + Dev + Staging)
+# =============================================================================
+# Mirrors spark-applicationset.yaml. Generates three ArgoCD Applications:
+#   - prod-flink:    watches environments/prod/flink-infra/ on 'main'  (manual sync)
+#   - staging-flink: watches environments/staging/flink-infra/ on 'main' (manual sync)
+#   - dev-flink:     watches environments/dev/flink-infra/  on 'develop' (auto-sync)
+#
+# Deploy:
+#   kubectl apply -f argocd/applicationsets/flink-applicationset.yaml -n argocd
+# =============================================================================
+
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: flink-platform
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    component: flink
+spec:
+  generators:
+    - list:
+        elements:
+          # ─── Production Flink ─────────────────────────────────────────────
+          - env: prod
+            cluster: https://kubernetes.default.svc
+            branch: main
+            path: environments/prod/flink-infra
+            auto_sync: "false"   # Manual deploy for prod
+            prune: "false"
+            self_heal: "false"
+
+          # ─── Staging Flink ────────────────────────────────────────────────
+          - env: staging
+            cluster: https://kubernetes.default.svc    # PLACEHOLDER: staging cluster endpoint
+            branch: main
+            path: environments/staging/flink-infra
+            auto_sync: "false"   # Manual sync for staging
+            prune: "false"
+            self_heal: "false"
+
+          # ─── Development Flink ────────────────────────────────────────────
+          - env: dev
+            cluster: https://kubernetes.default.svc
+            branch: develop
+            path: environments/dev/flink-infra
+            auto_sync: "true"
+            prune: "true"
+            self_heal: "true"
+
+  template:
+    metadata:
+      name: "{{env}}-flink"
+      namespace: argocd
+      labels:
+        app.kubernetes.io/part-of: de-platform
+        component: flink
+        environment: "{{env}}"
+      annotations:
+        notifications.argoproj.io/subscribe.on-sync-failed.slack: "de-alerts-{{env}}"
+        notifications.argoproj.io/subscribe.on-sync-succeeded.slack: "de-platform-info"
+
+    spec:
+      project: de-platform
+
+      source:
+        repoURL: "https://github.com/<ORG>/de-platform.git"  # PLACEHOLDER
+        targetRevision: "{{branch}}"
+        path: "{{path}}"
+        directory:
+          recurse: true
+          exclude: "{*.md,**/helm/**,**/docs/**}"
+
+      destination:
+        server: "{{cluster}}"
+        namespace: flink
+
+      syncPolicy:
+        automated:
+          prune: "{{prune}}"
+          selfHeal: "{{self_heal}}"
+          allowEmpty: false
+        syncOptions:
+          - CreateNamespace=true
+          - PruneLast=true
+          - ApplyOutOfSyncOnly=true
+          - ServerSideApply=true
+          - RespectIgnoreDifferences=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m
+
+      ignoreDifferences:
+        - group: flink.apache.org
+          kind: FlinkDeployment
+          jsonPointers:
+            - /status
+            - /spec/job/parallelism
+        - group: apps
+          kind: Deployment
+          jsonPointers:
+            - /spec/replicas
+        - group: ""
+          kind: Secret
+          jsonPointers:
+            - /data

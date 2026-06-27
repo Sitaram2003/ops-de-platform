@@ -1,0 +1,31 @@
+# Debezium MySQL CDC Connector — Staging
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaConnector
+metadata:
+  name: debezium-mysql-orders-staging
+  namespace: kafka-connect
+  labels:
+    strimzi.io/cluster: de-connect-cluster
+    environment: staging
+spec:
+  class: io.debezium.connector.mysql.MySqlConnector
+  tasksMax: 1
+  config:
+    database.hostname: "${env:MYSQL_DB_HOSTNAME}"
+    database.port: "${env:MYSQL_DB_PORT}"
+    database.user: "${env:MYSQL_DB_USERNAME}"
+    database.password: "${env:MYSQL_DB_PASSWORD}"
+    database.server.id: "223456"
+    database.server.name: staging-orders-db
+    database.include.list: orders_staging
+    table.include.list: "orders_staging.orders,orders_staging.order_items"
+    topic.prefix: cdc
+    transforms: unwrap,addHeader
+    transforms.unwrap.type: io.debezium.transforms.ExtractNewRecordState
+    transforms.unwrap.drop.tombstones: "false"
+    transforms.addHeader.type: org.apache.kafka.connect.transforms.InsertHeader
+    transforms.addHeader.header: source-env
+    transforms.addHeader.value.literal: staging
+    errors.deadletterqueue.topic.name: dlq.cdc.mysql-orders
+    errors.tolerance: all
+    snapshot.mode: initial

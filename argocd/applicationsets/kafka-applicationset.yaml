@@ -1,0 +1,134 @@
+# =============================================================================
+# ARGOCD APPLICATION SET — Kafka Component (Prod + Dev + Staging)
+# =============================================================================
+# ApplicationSet generates multiple ArgoCD Applications from a template.
+# One ApplicationSet → generates 3 Applications: prod-kafka, staging-kafka, dev-kafka.
+#
+# Pattern: "App of Apps"
+#   This ApplicationSet is the top-level. It creates three ArgoCD Applications:
+#     - prod-kafka:    watches environments/prod/kafka-infra/ on 'main' branch
+#     - staging-kafka: watches environments/staging/kafka-infra/ on 'main' branch
+#     - dev-kafka:     watches environments/dev/kafka-infra/ on 'develop' branch
+#
+# Sync strategy:
+#   Prod:    manual sync with approval (deploy button in ArgoCD UI)
+#   Staging: manual sync (no automation)
+#   Dev:     auto-sync (every push to 'develop' branch auto-deploys to dev)
+#
+# Deploy ApplicationSet:
+#   kubectl apply -f argocd/applicationsets/kafka-applicationset.yaml -n argocd
+# =============================================================================
+
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: kafka-platform
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    component: kafka
+spec:
+  # Generator: creates one Application per entry in the list
+  generators:
+    - list:
+        elements:
+          # ─── Production Kafka ─────────────────────────────────────────────
+          - env: prod
+            cluster: https://kubernetes.default.svc    # Prod EKS in-cluster
+            branch: main
+            path: environments/prod/kafka-infra
+            auto_sync: "false"                         # Manual deploy for prod
+            prune: "false"                             # Never auto-delete prod resources
+            self_heal: "false"                         # Never auto-apply in prod
+
+          # ─── Staging Kafka ────────────────────────────────────────────────
+          - env: staging
+            cluster: https://kubernetes.default.svc    # PLACEHOLDER: staging cluster endpoint
+            branch: main
+            path: environments/staging/kafka-infra
+            auto_sync: "false"                         # Manual sync for staging
+            prune: "false"
+            self_heal: "false"
+
+          # ─── Development Kafka ────────────────────────────────────────────
+          - env: dev
+            cluster: https://kubernetes.default.svc    # Dev EKS in-cluster (if ArgoCD on dev cluster)
+            branch: develop
+            path: environments/dev/kafka-infra
+            auto_sync: "true"                          # Auto-sync dev on every git push
+            prune: "true"                              # Auto-delete removed resources in dev
+            self_heal: "true"                          # Revert manual kubectl changes in dev
+
+  template:
+    metadata:
+      # Application name: prod-kafka or dev-kafka
+      name: "{{env}}-kafka"
+      namespace: argocd
+      labels:
+        app.kubernetes.io/part-of: de-platform
+        component: kafka
+        environment: "{{env}}"
+      annotations:
+        # Notifications: Slack alert on sync failure
+        notifications.argoproj.io/subscribe.on-sync-failed.slack: "de-alerts-{{env}}"
+        notifications.argoproj.io/subscribe.on-sync-succeeded.slack: "de-platform-info"
+
+    spec:
+      project: de-platform           # AppProject defined in de-platform-project.yaml
+
+      source:
+        # PLACEHOLDER: replace with your Git repo URL
+        repoURL: "https://github.com/<ORG>/de-platform.git"
+        targetRevision: "{{branch}}"  # main for prod/staging, develop for dev
+        path: "{{path}}"
+
+        # Directory: ArgoCD applies all YAML files in the path recursively
+        directory:
+          recurse: true              # Apply all subdirectories (strimzi/, kafka-connect/, etc.)
+          exclude: |
+            {*.md,**/helm/**,**/docs/**}
+
+      destination:
+        server: "{{cluster}}"
+        namespace: kafka             # Default namespace (overridden by namespace field in each YAML)
+
+      syncPolicy:
+        # automated: auto-sync settings (only active when auto_sync="true")
+        automated:
+          prune: "{{prune}}"
+          selfHeal: "{{self_heal}}"
+          allowEmpty: false
+
+        syncOptions:
+          - CreateNamespace=true
+          - PruneLast=true
+          - ApplyOutOfSyncOnly=true
+          - ServerSideApply=true
+          - RespectIgnoreDifferences=true
+
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m
+
+      ignoreDifferences:
+        - group: kafka.strimzi.io
+          kind: Kafka
+          jsonPointers:
+            - /status
+            - /metadata/annotations/strimzi.io~1kraft
+        - group: kafka.strimzi.io
+          kind: KafkaConnect
+          jsonPointers:
+            - /status
+            - /spec/template/pod/metadata/annotations
+        - group: ""
+          kind: Secret
+          jsonPointers:
+            - /data
+        - group: apps
+          kind: Deployment
+          jsonPointers:
+            - /spec/replicas         # KEDA manages replica count — ignore git value post-deploy

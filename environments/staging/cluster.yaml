@@ -1,0 +1,98 @@
+# =============================================================================
+# STAGING CLUSTER — same as dev eksctl config with staging names/sizes
+# =============================================================================
+# eks-staging.yaml is the authoritative version under cluster-bootstrap/.
+# This file is kept here for reference and is a copy.
+# =============================================================================
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: de-platform-staging
+  region: ap-south-1
+  version: "1.29"
+
+iam:
+  withOIDC: true
+
+managedNodeGroups:
+  - name: operators-ng
+    instanceType: m5.xlarge
+    minSize: 2
+    maxSize: 6
+    desiredCapacity: 2
+    labels:
+      role: operators
+    taints:
+      - key: dedicated
+        value: operators
+        effect: NoSchedule
+
+  - name: monitoring-ng
+    instanceType: m5.xlarge
+    minSize: 1
+    maxSize: 3
+    desiredCapacity: 1
+    labels:
+      role: monitoring
+
+  - name: kafka-broker-ng
+    instanceType: r5.xlarge
+    minSize: 3
+    maxSize: 6
+    desiredCapacity: 3
+    labels:
+      role: kafka-broker
+    taints:
+      - key: dedicated
+        value: kafka-broker
+        effect: NoSchedule
+
+  - name: kafka-controller-ng
+    instanceType: m5.large
+    minSize: 3
+    maxSize: 3
+    desiredCapacity: 3
+    labels:
+      role: kafka-controller
+    taints:
+      - key: dedicated
+        value: kafka-controller
+        effect: NoSchedule
+
+  - name: flink-ng
+    instanceType: r5.xlarge
+    minSize: 2
+    maxSize: 20
+    desiredCapacity: 2
+    labels:
+      role: flink
+    taints:
+      - key: dedicated
+        value: flink
+        effect: NoSchedule
+
+  - name: spark-ng
+    instanceType: m5.2xlarge
+    minSize: 0
+    maxSize: 10
+    desiredCapacity: 0
+    spot: true
+    labels:
+      role: spark
+    taints:
+      - key: dedicated
+        value: spark
+        effect: NoSchedule
+
+  - name: kafka-connect-ng
+    instanceType: c5.xlarge
+    minSize: 2
+    maxSize: 4
+    desiredCapacity: 2
+    labels:
+      role: kafka-connect
+    taints:
+      - key: dedicated
+        value: kafka-connect
+        effect: NoSchedule

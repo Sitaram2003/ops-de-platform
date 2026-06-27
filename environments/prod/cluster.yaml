@@ -1,0 +1,264 @@
+# =============================================================================
+# PRODUCTION EKS CLUSTER — eksctl ClusterConfig
+# =============================================================================
+# Deploy:  eksctl create cluster -f environments/prod/eks-cluster.yaml
+# Upgrade: eksctl upgrade cluster -f environments/prod/eks-cluster.yaml
+#
+# Architecture:
+#   7 dedicated node groups — each tainted so only the right pods land on it.
+#   This prevents noisy-neighbour problems (e.g., Spark GC pauses disrupting Kafka).
+#
+# Cost levers:
+#   • Brokers/Flink/Spark auto-scale via Cluster Autoscaler (karpenter-compatible)
+#   • Controllers & Operators are fixed — they're small and can't be interrupted
+#   • On normal days: 3 broker nodes + 6 Flink nodes + 2 Spark nodes ≈ $X/day
+#   • On surge (flash sales): Cluster Autoscaler adds up to maxSize within ~90s
+# =============================================================================
+
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: de-platform-prod          # PLACEHOLDER: matches config/placeholders.yaml → eks.prod.cluster_name
+  region: ap-south-1              # Mumbai — change if your users are elsewhere
+  version: "1.31"                 # Always pin. Upgrade intentionally, not accidentally.
+
+iam:
+  withOIDC: true                  # Required for IRSA (IAM Roles for Service Accounts)
+                                  # Lets pods assume AWS IAM roles via projected tokens
+                                  # Netflix/Uber standard — no static IAM keys in pods
+
+# ─── VPC & Networking ─────────────────────────────────────────────────────────
+# eksctl creates a new VPC by default. For production, use your own VPC:
+# vpc:
+#   id: "vpc-xxxxxxxxxxxx"
+#   subnets:
+#     private:
+#       ap-south-1a: { id: "subnet-xxxxxxxxxxxx" }
+#       ap-south-1b: { id: "subnet-xxxxxxxxxxxx" }
+#       ap-south-1c: { id: "subnet-xxxxxxxxxxxx" }
+
+addons:
+  # EBS CSI Driver — required for dynamic EBS volume provisioning (StorageClass)
+  # Without this, PersistentVolumeClaims for Kafka broker storage will stay Pending
+  - name: aws-ebs-csi-driver
+    version: latest
+    attachPolicyARNs:
+      - arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy
+
+  # VPC CNI — manages pod networking within the VPC (each pod gets a real VPC IP)
+  - name: vpc-cni
+    version: latest
+
+  # CoreDNS — cluster-internal DNS (required for service discovery between pods)
+  - name: coredns
+    version: latest
+
+  # kube-proxy — manages iptables rules for Services
+  - name: kube-proxy
+    version: latest
+
+managedNodeGroups:
+
+  # ── 1. OPERATORS NODE GROUP ───────────────────────────────────────────────
+  # Runs: Strimzi Operator, Flink Operator, Spark Operator, External Secrets
+  #       Operator, cert-manager, ArgoCD, KEDA
+  # Fixed at 2 nodes — operators are lightweight and need HA (2 for PDB).
+  # m5.large: 2 vCPU, 8GB — sufficient for all operators combined (~3GB RAM).
+  - name: operators-ng
+    instanceType: m5.large
+    minSize: 2
+    maxSize: 2                    # Fixed — operators don't need auto-scaling
+    availabilityZones:
+      - ap-south-1a
+      - ap-south-1b
+    labels:
+      role: operators
+      environment: prod
+    taints:
+      - key: dedicated
+        value: operators
+        effect: NoSchedule        # Only pods with matching toleration land here
+
+  # ── 2. MONITORING NODE GROUP ──────────────────────────────────────────────
+  # Runs: Prometheus (high memory for TSDB), Grafana, Alertmanager, Loki, Tempo
+  # m5.2xlarge: 8 vCPU, 32GB
+  #   - Prometheus TSDB: 8–16GB RAM (depends on metric cardinality + retention)
+  #   - Grafana: 512MB
+  #   - Alertmanager: 256MB
+  #   - Loki: 2–4GB
+  #   2 nodes × ~26GB allocatable = 52GB headroom — comfortable
+  - name: monitoring-ng
+    instanceType: m5.2xlarge
+    minSize: 2
+    maxSize: 4
+    availabilityZones:
+      - ap-south-1a
+      - ap-south-1b
+      - ap-south-1c
+    labels:
+      role: monitoring
+      environment: prod
+    taints:
+      - key: dedicated
+        value: monitoring
+        effect: NoSchedule
+    iam:
+      withAddonPolicies:
+        cloudWatch: true          # Prometheus remote write to CloudWatch (optional)
+
+  # ── 3. KAFKA BROKER NODE GROUP ────────────────────────────────────────────
+  # Runs: Kafka broker pods (KafkaNodePool 'broker' and 'broker-tiered')
+  # r5.4xlarge: 16 vCPU, 128GB RAM — memory-optimized for OS page cache
+  #
+  # WHY r5 over i3en?
+  #   i3en.2xlarge has local NVMe but we use EBS — local NVMe is WASTED.
+  #   r5.4xlarge: 2× RAM (128GB vs 64GB) = 2× page cache = 2× read throughput.
+  #   EBS gp3-high-iops: 16K IOPS, 1000MB/s — delivered over network anyway.
+  #
+  # Capacity math:
+  #   r5.4xlarge allocatable: ~15 CPU, ~122GB RAM
+  #   Broker pod: 4 CPU req / 12 CPU limit, 32GB req / 64GB limit
+  #   Pattern: 1 broker per node (anti-affinity rule) — wastes node capacity
+  #   FIX: bump broker requests to 12 CPU, 96GB to fully utilize node
+  #        (see kafka-node-pool-broker.yaml)
+  #   Scale: 3 nodes (normal) → 12 nodes (flash sale surge) in ~90s
+  - name: kafka-brokers-ng
+    instanceType: r5.4xlarge
+    minSize: 3
+    maxSize: 12
+    availabilityZones:
+      - ap-south-1a
+      - ap-south-1b
+      - ap-south-1c
+    labels:
+      role: kafka-broker
+      environment: prod
+    taints:
+      - key: dedicated
+        value: kafka-broker
+        effect: NoSchedule
+    iam:
+      withAddonPolicies:
+        autoScaler: true
+
+  # ── 4. KAFKA CONTROLLER NODE GROUP ───────────────────────────────────────
+  # Runs: KRaft controllers (Raft quorum — cluster metadata consensus)
+  # m5.xlarge: 4 vCPU, 16GB — right-sized for controller-only workload
+  # FIXED at 3 — Raft quorum MUST be odd, NEVER auto-scales.
+  # Rationale: changing quorum size requires a Raft membership change protocol.
+  #            Cluster Autoscaler must never terminate controller nodes.
+  - name: kafka-controllers-ng
+    instanceType: m5.xlarge
+    minSize: 3
+    maxSize: 3                    # HARD FIXED — Raft quorum never auto-scales
+    availabilityZones:
+      - ap-south-1a
+      - ap-south-1b
+      - ap-south-1c
+    labels:
+      role: kafka-controller
+      environment: prod
+    taints:
+      - key: dedicated
+        value: kafka-controller
+        effect: NoSchedule
+
+  # ── 5. FLINK NODE GROUP ───────────────────────────────────────────────────
+  # Runs: Flink TaskManagers (stream processing — clickstream, CDC, GPS)
+  # r5.2xlarge: 8 vCPU, 64GB — memory-optimized for RocksDB state backend
+  #
+  # Memory breakdown per Flink TM pod (10GB request):
+  #   JVM heap:        4GB  (user code, operator state objects in heap)
+  #   Managed memory:  4GB  (RocksDB off-heap — the incremental state backend)
+  #   Network buffers: 1.6GB (20% of total TM memory — Flink's fixed allocation)
+  #   JVM overhead:    0.5GB (metaspace, code cache, thread stacks)
+  #   → Pod request: 10GB, limit: 12GB
+  #
+  # r5.2xlarge allocatable: ~60GB → floor(60/10) = 6 TM pods per node
+  # Max TMs: 120 (clickstream partitions) → ceil(120/6) = 20 nodes at peak
+  # maxSize: 40 covers all 3 jobs simultaneously at surge (360 TM slots)
+  - name: flink-ng
+    instanceType: r5.2xlarge
+    minSize: 6                    # Pre-warm 6 nodes (36 TM slots) — avoids cold start on surge
+    maxSize: 40                   # 40 × 6 = 240 TM slots (covers surge)
+    availabilityZones:
+      - ap-south-1a
+      - ap-south-1b
+      - ap-south-1c
+    labels:
+      role: flink
+      environment: prod
+    taints:
+      - key: dedicated
+        value: flink
+        effect: NoSchedule
+    iam:
+      withAddonPolicies:
+        autoScaler: true
+
+  # ── 6. SPARK NODE GROUP ───────────────────────────────────────────────────
+  # Runs: Spark executors (batch analytics — daily aggregations, Snowflake loads)
+  # m5.4xlarge: 16 vCPU, 64GB — balanced CPU+RAM for Spark shuffle + sort
+  #
+  # WHY SPOT for Spark (but ON-DEMAND for Kafka/Flink)?
+  #   Spark batch jobs are ephemeral and schedule-triggered. A Spot interruption
+  #   (2-min warning) causes the affected executor to be re-queued by the Spark
+  #   driver — the job retries the lost task automatically.
+  #   Kafka and Flink are stateful long-running — interruption = data loss risk.
+  #
+  # Mixed instance policy: multiple instance types improve Spot availability.
+  #   If m5.4xlarge pool is exhausted, AWS uses m5a.4xlarge or m4.4xlarge instead.
+  #
+  # Cost: Spot saves ~70% vs On-Demand for m5.4xlarge (~$0.77/h → ~$0.23/h)
+  - name: spark-ng
+    instanceTypes:
+      - m5.4xlarge
+      - m5a.4xlarge
+      - m4.4xlarge
+    spot: true
+    minSize: 2
+    maxSize: 30                   # 30 × 2 executors = 60 slots (3 concurrent batch jobs at peak)
+    availabilityZones:
+      - ap-south-1a
+      - ap-south-1b
+      - ap-south-1c
+    labels:
+      role: spark
+      environment: prod
+    taints:
+      - key: dedicated
+        value: spark
+        effect: NoSchedule
+    iam:
+      withAddonPolicies:
+        autoScaler: true
+
+  # ── 7. KAFKA CONNECT NODE GROUP ───────────────────────────────────────────
+  # Runs: Kafka Connect workers (Debezium CDC producers, S3 Sink consumers)
+  # c5.2xlarge: 8 vCPU, 16GB — compute-optimized for Avro serialization + S3 upload
+  #
+  # WHY c5 (compute-optimized)?
+  #   Debezium snapshot: CPU-bound (serializing millions of rows → Avro → Kafka)
+  #   S3 Sink: CPU-bound (Parquet encoding + Snappy/LZ4 compression)
+  #   Memory: 8GB per worker (Debezium snapshot buffer + S3 multipart buffer)
+  #   c5.2xlarge allocatable: ~7.5 CPU, ~14GB → exactly 1 Connect worker per node
+  #   More CPU per dollar than m5 for this CPU-intensive workload.
+  - name: kafka-connect-ng
+    instanceType: c5.2xlarge
+    minSize: 3                    # 3 workers: 1 for Debezium PG, 1 for Debezium MySQL, 1 for S3 Sink
+    maxSize: 9                    # Scale during CDC snapshot bursts or new table onboarding
+    availabilityZones:
+      - ap-south-1a
+      - ap-south-1b
+      - ap-south-1c
+    labels:
+      role: kafka-connect
+      environment: prod
+    taints:
+      - key: dedicated
+        value: kafka-connect
+        effect: NoSchedule
+    iam:
+      withAddonPolicies:
+        autoScaler: true

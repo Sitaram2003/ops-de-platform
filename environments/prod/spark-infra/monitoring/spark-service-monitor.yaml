@@ -1,0 +1,53 @@
+# =============================================================================
+# SPARK SERVICE MONITOR — Prometheus Scrape Config (Prod)
+# =============================================================================
+# The spark-on-k8s-operator exposes metrics via a K8s Service, not directly
+# on driver/executor pods. This ServiceMonitor targets that Service.
+#
+# Why ServiceMonitor (not PodMonitor):
+#   • The operator runs as a single pod with a named K8s Service
+#   • The operator metrics (spark_app_count, spark_app_executor_count) give
+#     fleet-level visibility: how many jobs succeeded, failed, or are running
+#   • Individual driver metrics (port 4040, SparkUI) are ephemeral — only
+#     available while a job runs. For ad-hoc debugging, use:
+#       kubectl port-forward -n spark <driver-pod> 4040:4040
+#
+# Operator metrics (spark-on-k8s-operator v1.1.27, port 10254):
+#   spark_app_count{namespace, state}          — count by COMPLETED/FAILED/RUNNING/SUBMITTED
+#   spark_app_executor_count{namespace, state} — executor count by RUNNING/PENDING/SUCCEEDED/FAILED
+#   spark_app_submit_count{namespace}          — total submissions
+#
+# The spark-operator Helm chart creates a Service named 'spark-operator'
+# in the 'spark' namespace with port 'metrics' (10254).
+# =============================================================================
+
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: spark-operator-service-monitor
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: de-platform
+    environment: prod
+    prometheus: kube-prometheus
+spec:
+  namespaceSelector:
+    matchNames:
+      - spark
+
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: spark-operator   # Label set by Helm chart on the Service
+
+  endpoints:
+    - port: metrics            # Port name on the spark-operator Service (10254)
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_service_namespace]
+          targetLabel: namespace
+        - sourceLabels: [__meta_kubernetes_service_name]
+          targetLabel: service
+        - targetLabel: environment
+          replacement: prod
