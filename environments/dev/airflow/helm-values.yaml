@@ -29,14 +29,36 @@ dags:
     enabled: false
   gitSync:
     enabled: true
-    repo: git@github.com:Sitaram2003/ops-de-jobs.git
+    repo: https://github.com/Sitaram2003/ops-de-jobs.git
     branch: main
     rev: HEAD
     depth: 1
     subPath: airflow
-    sshKeySecret: git-credentials
     period: 60s
     containerName: git-sync
+
+env:
+  - name: GIT_SYNC_USERNAME
+    valueFrom:
+      secretKeyRef:
+        name: git-credentials
+        key: GIT_SYNC_USERNAME
+  - name: GIT_SYNC_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: git-credentials
+        key: GIT_SYNC_PASSWORD
+  - name: GITSYNC_USERNAME
+    valueFrom:
+      secretKeyRef:
+        name: git-credentials
+        key: GITSYNC_USERNAME
+  - name: GITSYNC_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: git-credentials
+        key: GITSYNC_PASSWORD
+  # rest of your env vars...
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
 scheduler:
@@ -92,10 +114,31 @@ postgresql:
   image:
     repository: bitnamilegacy/postgresql
     tag: "16.1.0-debian-11-r15"
-  auth:                      
-    existingSecret: airflow-postgres-secret     
+  auth:
+    existingSecret: airflow-postgres-secret
     secretKeys:
-      adminPasswordKey: postgresql-password
+      adminPasswordKey: postgres-password       # ← superuser
+      userPasswordKey: postgresql-password      # ← app user
+    username: "airflow"
+    database: "airflow"
+  primary:
+    persistence:
+      enabled: false
+    resources:
+      requests:
+        cpu: 250m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    podSecurityContext:
+      enabled: true
+      fsGroup: 1001
+    containerSecurityContext:
+      enabled: true
+      runAsUser: 1001
+      runAsNonRoot: true
+      allowPrivilegeEscalation: false
 
   primary:
     persistence:
