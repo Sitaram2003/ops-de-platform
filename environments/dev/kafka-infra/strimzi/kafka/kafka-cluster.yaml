@@ -1,5 +1,5 @@
 # =============================================================================
-# DEV KAFKA CLUSTER CR — Strimzi KRaft Mode
+# DEV KAFKA CLUSTER CR — Strimzi KRaft Mode (Fixed for Strimzi 0.51.0)
 # =============================================================================
 # Dev cluster mirrors prod topology but at minimal scale.
 # Key differences from prod:
@@ -31,6 +31,12 @@ spec:
     metadataVersion: 3.7-IV4
 
     listeners:
+      # FIX 1: Explicit internal KRaft quorum listener required for Strimzi 0.51.0
+      - name: controller
+        port: 9090
+        type: internal
+        tls: true
+
       # Internal listener — same as prod (in-cluster traffic)
       - name: tls
         port: 9093
@@ -81,9 +87,6 @@ spec:
 
       compression.type: lz4
 
-      # NO tiered storage in dev — cost not justified for dev data volumes
-      # To test tiered storage behavior, use a dedicated staging environment
-
       auto.create.topics.enable: "false"
       delete.topic.enable: "true"
       group.initial.rebalance.delay.ms: 1000   # Shorter in dev (faster test iteration)
@@ -93,12 +96,7 @@ spec:
     rack:
       topologyKey: topology.kubernetes.io/zone
 
-    metricsConfig:
-      type: jmxPrometheusExporter
-      valueFrom:
-        configMapKeyRef:
-          name: kafka-jmx-exporter-config
-          key: kafka-metrics-config.yml
+    # FIX 2: metricsConfig block removed from here. It MUST live in the NodePool manifest.
 
     readinessProbe:
       initialDelaySeconds: 20
@@ -128,4 +126,3 @@ spec:
           cpu: "0.3"
       reconciliationIntervalSeconds: 60
 
-  # No CruiseControl in dev — single broker doesn't need partition rebalancing

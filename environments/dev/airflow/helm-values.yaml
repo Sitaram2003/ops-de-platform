@@ -1,64 +1,44 @@
 # =============================================================================
 # AIRFLOW HELM VALUES — Dev
 # =============================================================================
-# Consumed by the ArgoCD multi-source Application in operator/airflow-app.yaml
-# via $values/environments/dev/airflow/helm-values.yaml.
-#
-# Differences from prod:
-#   - Resources halved (scheduler, webserver, triggerer, postgresql)
-#   - PostgreSQL persistence disabled (emptyDir — faster pod restarts in dev)
-#   - git-sync branch: main (same as staging/prod — trunk-based, envs differ by image tags)
-#   - Remote logging disabled (keep logs local in dev)
-# =============================================================================
 
 executor: KubernetesExecutor
 
-# ── Airflow config overrides ──────────────────────────────────────────────────
+# ── Airflow config ────────────────────────────────────────────────────────────
+
 config:
   core:
     dags_are_paused_at_creation: "true"
     load_examples: "false"
-    dags_folder: /opt/airflow/dags/repo/HEAD/dags
+    dags_folder: /opt/airflow/dags/repo/airflow/dags   # ← subPath, not "dags"
+  logging:
+    remote_logging: "true"
+    remote_log_conn_id: aws_default
+    remote_base_log_folder: s3://de-infra-bucket/airflow/logs
+    encrypt_s3_logs: "false"
   kubernetes_executor:
     namespace: airflow
     worker_service_account_name: airflow-sa
 
-# ── DAGs via git-sync ─────────────────────────────────────────────────────────
+# ── DAGs via git-sync (SSH) ───────────────────────────────────────────────────
 dags:
   persistence:
     enabled: false
   gitSync:
     enabled: true
-    repo: https://github.com/Sitaram2003/ops-de-jobs.git
+    repo: git@github.com:Sitaram2003/ops-de-jobs.git  # ← SSH URL
     branch: main
     rev: HEAD
     depth: 1
     subPath: airflow
+    sshKeySecret: airflow-git-ssh   # K8s secret name
     period: 60s
     containerName: git-sync
-
-env:
-  - name: GIT_SYNC_USERNAME
-    valueFrom:
-      secretKeyRef:
-        name: git-credentials
-        key: GIT_SYNC_USERNAME
-  - name: GIT_SYNC_PASSWORD
-    valueFrom:
-      secretKeyRef:
-        name: git-credentials
-        key: GIT_SYNC_PASSWORD
-  - name: GITSYNC_USERNAME
-    valueFrom:
-      secretKeyRef:
-        name: git-credentials
-        key: GITSYNC_USERNAME
-  - name: GITSYNC_PASSWORD
-    valueFrom:
-      secretKeyRef:
-        name: git-credentials
-        key: GITSYNC_PASSWORD
-  # rest of your env vars...
+    uid: 65533                                         # git-sync default uid
+    knownHosts: |
+      github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
+      github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
+      github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
 scheduler:
@@ -66,13 +46,20 @@ scheduler:
   resources:
     requests:
       cpu: 250m
-      memory: 256Mi
+      memory: 512Mi
     limits:
       cpu: 500m
-      memory: 512Mi
+      memory: 900Mi
 
 # ── Webserver ─────────────────────────────────────────────────────────────────
-webserver:
+apiServer:
+  service:
+    type: NodePort
+    ports:
+      - name: airflow-ui
+        port: 8080
+        targetPort: 8080
+        nodePort: 30080
   resources:
     requests:
       cpu: 250m
@@ -80,16 +67,16 @@ webserver:
     limits:
       cpu: 500m
       memory: 1Gi
-  service:
-    type: ClusterIP
+
+createUserJob:
+  enabled: true
   defaultUser:
-    enabled: true
     role: Admin
     username: admin
-    email: ops.dataeng@gmail.com
-    firstName: Airflow
-    lastName: Admin
-    password: "Admin@123"
+    email: admin@example.com
+    firstName: admin
+    lastName: user
+    password: admin
 
 # ── Triggerer ─────────────────────────────────────────────────────────────────
 triggerer:
@@ -97,18 +84,20 @@ triggerer:
   resources:
     requests:
       cpu: 100m
-      memory: 128Mi
+      memory: 256Mi
     limits:
       cpu: 250m
-      memory: 256Mi
+      memory: 512Mi
 
 # ── Security ──────────────────────────────────────────────────────────────────
 fernetKeySecretName: airflow-fernet-key
 webserverSecretKeySecretName: airflow-webserver-secret
 
+# ── Database ──────────────────────────────────────────────────────────────────
 data:
-  metadataSecretName: airflow-metadata-conn  
-# ── PostgreSQL — emptyDir in dev (data lost on pod restart, intentional) ──────
+  metadataSecretName: airflow-metadata-conn
+
+# ── PostgreSQL ────────────────────────────────────────────────────────────────
 postgresql:
   enabled: true
   image:
@@ -117,29 +106,10 @@ postgresql:
   auth:
     existingSecret: airflow-postgres-secret
     secretKeys:
-      adminPasswordKey: postgres-password       # ← superuser
-      userPasswordKey: postgresql-password      # ← app user
+      adminPasswordKey: postgres-password
+      userPasswordKey: postgresql-password
     username: "airflow"
     database: "airflow"
-  primary:
-    persistence:
-      enabled: false
-    resources:
-      requests:
-        cpu: 250m
-        memory: 256Mi
-      limits:
-        cpu: 500m
-        memory: 512Mi
-    podSecurityContext:
-      enabled: true
-      fsGroup: 1001
-    containerSecurityContext:
-      enabled: true
-      runAsUser: 1001
-      runAsNonRoot: true
-      allowPrivilegeEscalation: false
-
   primary:
     persistence:
       enabled: false
@@ -164,16 +134,18 @@ serviceAccount:
   create: false
   name: airflow-sa
 
-# ── Airflow Variables (injected as environment variables) ─────────────────────
+# ── Environment variables ─────────────────────────────────────────────────────
 env:
+  - name: AIRFLOW_CONN_AWS_DEFAULT
+    value: 'aws://?region_name=ap-south-2'
+    
+  # ← GIT_SYNC_SSH removed; SSH is activated by sshKeySecret automatically
   - name: AIRFLOW_VAR_SPARK_DQ_REPORT_IMAGE
     value: "940507692220.dkr.ecr.ap-south-1.amazonaws.com/spark-dq-report:latest"
   - name: AIRFLOW_VAR_SPARK_CLICKSTREAM_AGG_IMAGE
     value: "940507692220.dkr.ecr.ap-south-1.amazonaws.com/spark-clickstream-agg:latest"
   - name: AIRFLOW_VAR_SPARK_TRANSACTION_ANALYTICS_IMAGE
     value: "940507692220.dkr.ecr.ap-south-1.amazonaws.com/spark-transaction-analytics:latest"
-
-    
   - name: AIRFLOW_VAR_S3_DATA_LAKE_BUCKET
     value: "de-data-lake-dev"
   - name: AIRFLOW_VAR_SNOWFLAKE_WAREHOUSE

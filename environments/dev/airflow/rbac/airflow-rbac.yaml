@@ -10,6 +10,9 @@ kind: ServiceAccount
 metadata:
   name: airflow-sa
   namespace: airflow
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::940507692220:role/EC2-K3s-Secret-Role
+    eks.amazonaws.com/token-expiration: "86400"
   labels:
     app.kubernetes.io/name: airflow-sa
     app.kubernetes.io/part-of: de-platform
@@ -31,7 +34,10 @@ rules:
     verbs: [get, list, watch, create, delete, patch]
   - apiGroups: [""]
     resources: [pods/log]
-    verbs: [get, list]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [pods/exec]          
+    verbs: [get, create]
   - apiGroups: [""]
     resources: [configmaps]
     verbs: [get, list, watch]
@@ -54,6 +60,9 @@ metadata:
 subjects:
   - kind: ServiceAccount
     name: airflow-sa
+    namespace: airflow
+  - kind: ServiceAccount
+    name: airflow-scheduler
     namespace: airflow
 roleRef:
   kind: Role
